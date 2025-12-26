@@ -1,49 +1,230 @@
-name: Python Pipeline with Download
+name: 🐍 Python Code Runner
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      python_code:
+        description: 'Python code to execute (single line)'
+        required: true
+        default: 'print("Hello, World!")'
+        
+      python_script:
+        description: 'Multi-line Python script'
+        required: false
+        default: |
+          # Multi-line Python script
+          import math
+          import datetime
+          
+          print("=== Python Script Runner ===")
+          print(f"Python Version: {math.__version__}")
+          print(f"Current Time: {datetime.datetime.now()}")
+          
+          # Calculate something
+          numbers = [1, 2, 3, 4, 5]
+          total = sum(numbers)
+          average = total / len(numbers)
+          
+          print(f"\nNumbers: {numbers}")
+          print(f"Sum: {total}")
+          print(f"Average: {average}")
+          
+          # Create a file
+          with open('results.txt', 'w') as f:
+              f.write(f'Results saved at {datetime.datetime.now()}\n')
+              f.write(f'Sum: {total}\n')
+              f.write(f'Average: {average}\n')
+          
+          print("\n✅ Script completed successfully!")
+          
+      install_packages:
+        description: 'Packages to install (comma-separated)'
+        required: false
+        default: 'numpy,requests,pandas'
+        
+      timeout_minutes:
+        description: 'Timeout in minutes'
+        required: false
+        default: '10'
+        
+      save_output:
+        description: 'Save output as artifact?'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+        default: 'yes'
 
 jobs:
-  generate-data:
+  setup-environment:
     runs-on: ubuntu-latest
-    outputs:
-      filename: ${{ steps.set-output.outputs.filename }}
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
     
     steps:
-    - name: Create data file
-      run: |
-        echo "data1,data2,data3" > data.csv
-        echo "1,2,3" >> data.csv
-        echo "4,5,6" >> data.csv
-        
-    - name: Set output variable
-      id: set-output
-      run: echo "filename=data.csv" >> $GITHUB_OUTPUT
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    - name: 🏗️ Setup Python
+      uses: actions/setup-python@v4
       with:
-        name: data-files
-        path: data.csv
+        python-version: '3.10'
         
-  process-data:
+    - name: 📦 Install requested packages
+      if: ${{ github.event.inputs.install_packages != '' }}
+      run: |
+        echo "Installing packages: ${{ github.event.inputs.install_packages }}"
+        pip install ${{ github.event.inputs.install_packages }}
+        pip list
+        
+  run-single-line:
+    needs: setup-environment
     runs-on: ubuntu-latest
-    needs: generate-data
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
     
     steps:
-    - name: Download artifact
+    - name: 🔧 Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: 🚀 Execute single-line Python code
+      if: ${{ github.event.inputs.python_code != '' }}
+      id: execute-single
+      run: |
+        echo "📝 Executing Python code..."
+        echo "Code: ${{ github.event.inputs.python_code }}"
+        echo "--------------------------------------------------"
+        python3 -c "${{ github.event.inputs.python_code }}"
+        EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        echo "--------------------------------------------------"
+        echo "Exit Code: $EXIT_CODE"
+        
+    - name: 💾 Save single-line output
+      if: ${{ github.event.inputs.save_output == 'yes' && github.event.inputs.python_code != '' }}
+      run: |
+        python3 -c "${{ github.event.inputs.python_code }}" > single_line_output.txt 2>&1
+        echo "Single-line code output saved to file"
+        
+  run-multi-line:
+    needs: setup-environment
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
+    
+    steps:
+    - name: 🔧 Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: 📝 Create multi-line script file
+      if: ${{ github.event.inputs.python_script != '' }}
+      run: |
+        echo "Creating script.py..."
+        cat > script.py << 'EOF'
+${{ github.event.inputs.python_script }}
+EOF
+        echo "Script created. Content preview:"
+        echo "--------------------------------------------------"
+        head -20 script.py
+        echo "--------------------------------------------------"
+        
+    - name: 🚀 Execute multi-line Python script
+      if: ${{ github.event.inputs.python_script != '' }}
+      id: execute-multi
+      run: |
+        echo "📝 Executing Python script..."
+        echo "--------------------------------------------------"
+        python3 script.py
+        EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        echo "--------------------------------------------------"
+        echo "Exit Code: $EXIT_CODE"
+        
+    - name: 💾 Save script output
+      if: ${{ github.event.inputs.save_output == 'yes' && github.event.inputs.python_script != '' }}
+      run: |
+        python3 script.py > script_output.txt 2>&1
+        echo "Script output saved to file"
+        
+    - name: 📊 List generated files
+      run: |
+        echo "Generated files:"
+        ls -la *.py *.txt 2>/dev/null || echo "No generated files"
+        
+  upload-results:
+    needs: [run-single-line, run-multi-line]
+    runs-on: ubuntu-latest
+    if: always()  # Run even if previous jobs fail
+    
+    steps:
+    - name: 📥 Download artifacts from previous jobs
       uses: actions/download-artifact@v4
       with:
-        name: data-files
-        path: ./downloaded
+        pattern: '*'
+        merge-multiple: true
         
-    - name: Process data
+    - name: 📁 Create results summary
       run: |
-        echo "Processing downloaded files..."
-        ls -la ./downloaded/
-        python3 -c "
-        import csv
-        with open('./downloaded/data.csv', 'r') as f:
-            reader = csv.reader(f)
-            total = sum(int(row[1]) for row in reader if row[0] != 'data1')
-            print(f'Sum of data2 column: {total}')
-        "
+        echo "📊 PYTHON CODE RUNNER RESULTS" > SUMMARY.md
+        echo "=============================" >> SUMMARY.md
+        echo "" >> SUMMARY.md
+        echo "**Run Information:**" >> SUMMARY.md
+        echo "- Workflow: ${{ github.workflow }}" >> SUMMARY.md
+        echo "- Run ID: ${{ github.run_id }}" >> SUMMARY.md
+        echo "- Triggered by: ${{ github.actor }}" >> SUMMARY.md
+        echo "- Timestamp: $(date)" >> SUMMARY.md
+        echo "" >> SUMMARY.md
+        
+        if [ -f "single_line_output.txt" ]; then
+          echo "## Single-line Code Output" >> SUMMARY.md
+          echo '```' >> SUMMARY.md
+          cat single_line_output.txt >> SUMMARY.md
+          echo '```' >> SUMMARY.md
+          echo "" >> SUMMARY.md
+        fi
+        
+        if [ -f "script_output.txt" ]; then
+          echo "## Multi-line Script Output" >> SUMMARY.md
+          echo '```' >> SUMMARY.md
+          cat script_output.txt >> SUMMARY.md
+          echo '```' >> SUMMARY.md
+          echo "" >> SUMMARY.md
+        fi
+        
+        if [ -f "script.py" ]; then
+          echo "## Generated Script" >> SUMMARY.md
+          echo '```python' >> SUMMARY.md
+          cat script.py >> SUMMARY.md
+          echo '```' >> SUMMARY.md
+        fi
+        
+    - name: 📤 Upload all results
+      if: ${{ github.event.inputs.save_output == 'yes' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-runner-results-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          *.txt
+          *.py
+          *.md
+        retention-days: 7
+        compression-level: 6
+        
+    - name: 🗑️ Cleanup temporary files
+      if: ${{ github.event.inputs.save_output == 'no' }}
+      run: |
+        echo "Cleaning up temporary files..."
+        rm -f *.txt *.py *.md
+
+  send-notification:
+    needs: [run-single-line, run-multi-line]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: 📢 Workflow status
+      run: |
+        echo "========================================"
+        echo "🐍 PYTHON CODE RUNNER COMPLETE"
+        echo "========================================"
+        echo "Single-line execution: ${{ needs.run-single-line.result }}"
+        echo "Multi-line execution: ${{ needs.run-multi-line.result }}"
+        echo ""
+        echo "📎 Artifacts available: ${{ github.event.inputs.save_output == 'yes' && 'YES' || 'NO' }}"
+        echo "⏱️ Timeout: ${{ github.event.inputs.timeout_minutes }} minutes"
+        echo "📦 Packages installed: ${{ github.event.inputs.install_packages }}"
+        echo "========================================"
