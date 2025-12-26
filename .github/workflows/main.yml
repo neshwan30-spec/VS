@@ -1,26 +1,49 @@
-name: Safe Python Runner
+name: Python Pipeline with Download
 
-on:
-  workflow_dispatch:
-    inputs:
-      python_code:
-        description: 'Python code to run'
-        required: true
+on: workflow_dispatch
 
 jobs:
-  run-safely:
+  generate-data:
     runs-on: ubuntu-latest
+    outputs:
+      filename: ${{ steps.set-output.outputs.filename }}
+    
     steps:
-    - name: Basic validation
+    - name: Create data file
       run: |
-        # Simple check for dangerous commands
-        CODE="${{ github.event.inputs.python_code }}"
-        if [[ "$CODE" == *"os.system"* ]] || [[ "$CODE" == *"subprocess"* ]] || [[ "$CODE" == *"__import__"* ]]; then
-          echo "⚠️  Potentially unsafe code detected!"
-          exit 1
-        fi
+        echo "data1,data2,data3" > data.csv
+        echo "1,2,3" >> data.csv
+        echo "4,5,6" >> data.csv
         
-    - name: Run in container (safer)
-      uses: docker://python:3.9-slim
+    - name: Set output variable
+      id: set-output
+      run: echo "filename=data.csv" >> $GITHUB_OUTPUT
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        args: python -c "${{ github.event.inputs.python_code }}"
+        name: data-files
+        path: data.csv
+        
+  process-data:
+    runs-on: ubuntu-latest
+    needs: generate-data
+    
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: data-files
+        path: ./downloaded
+        
+    - name: Process data
+      run: |
+        echo "Processing downloaded files..."
+        ls -la ./downloaded/
+        python3 -c "
+        import csv
+        with open('./downloaded/data.csv', 'r') as f:
+            reader = csv.reader(f)
+            total = sum(int(row[1]) for row in reader if row[0] != 'data1')
+            print(f'Sum of data2 column: {total}')
+        "
