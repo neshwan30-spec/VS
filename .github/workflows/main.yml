@@ -1,4 +1,4 @@
-name: Python Code Runner
+name: Safe Python Runner
 
 on:
   workflow_dispatch:
@@ -6,23 +6,21 @@ on:
       python_code:
         description: 'Python code to run'
         required: true
-        default: 'print("Hello, World!")'
 
 jobs:
-  execute-python:
+  run-safely:
     runs-on: ubuntu-latest
     steps:
-    - name: Execute Python Code
+    - name: Basic validation
       run: |
-        echo 'Executing Python code...'
-        python3 -c "${{ github.event.inputs.python_code }}"
+        # Simple check for dangerous commands
+        CODE="${{ github.event.inputs.python_code }}"
+        if [[ "$CODE" == *"os.system"* ]] || [[ "$CODE" == *"subprocess"* ]] || [[ "$CODE" == *"__import__"* ]]; then
+          echo "⚠️  Potentially unsafe code detected!"
+          exit 1
+        fi
         
-    - name: Save output to file
-      run: |
-        python3 -c "${{ github.event.inputs.python_code }}" > output.txt
-        
-    - name: Upload output
-      uses: actions/upload-artifact@v3
+    - name: Run in container (safer)
+      uses: docker://python:3.9-slim
       with:
-        name: python-output
-        path: output.txt
+        args: python -c "${{ github.event.inputs.python_code }}"
