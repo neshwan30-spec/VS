@@ -6,13 +6,23 @@ on:
       python_code:
         description: 'Python code to run'
         required: true
+        default: 'print("Hello, World!")'
 
 jobs:
-  execute:
+  execute-python:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Execute Python code
+    - name: Execute Python Code
       run: |
+        echo 'Executing Python code...'
         python3 -c "${{ github.event.inputs.python_code }}"
+        
+    - name: Save output to file
+      run: |
+        python3 -c "${{ github.event.inputs.python_code }}" > output.txt
+        
+    - name: Upload output
+      uses: actions/upload-artifact@v3
+      with:
+        name: python-output
+        path: output.txt
