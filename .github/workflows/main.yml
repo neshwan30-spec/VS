@@ -1,4 +1,4 @@
-name: Windows 11 + Google IAP SSH + RDP
+name: win 11 + Chrome Remote Desktop + Download.bat script 
 
 on:
   workflow_dispatch:
@@ -20,11 +20,11 @@ jobs:
                              -Name "SecurityLayer" -Value 0 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-GoogleSSH"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
          
-          # Allow RDP only from localhost (will be tunneled through SSH)
-          netsh advfirewall firewall add rule name="RDP-GoogleSSH" `
-            dir=in action=allow protocol=TCP localport=3389 remoteip=127.0.0.1
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
@@ -46,47 +46,58 @@ jobs:
               exit 1
           }
 
-      - name: Install OpenSSH Server
+      - name: Install Chrome Remote Desktop
         run: |
-          # Install OpenSSH Server
-          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          $crUrl = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $installerPath = "$env:TEMP\chromeremotedesktophost.msi"
           
-          # Start and configure SSH service
-          Start-Service sshd
-          Set-Service -Name sshd -StartupType 'Automatic'
+          # Download Chrome Remote Desktop Host MSI
+          Invoke-WebRequest -Uri $crUrl -OutFile $installerPath
           
-          # Configure SSH to allow password authentication
-          $sshdConfig = "C:\ProgramData\ssh\sshd_config"
-          (Get-Content $sshdConfig) -replace '#PasswordAuthentication yes', 'PasswordAuthentication yes' | Set-Content $sshdConfig
-          (Get-Content $sshdConfig) -replace '#PermitEmptyPasswords no', 'PermitEmptyPasswords no' | Set-Content $sshdConfig
+          # Install silently
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           
-          # Restart SSH service
-          Restart-Service sshd
+          # Clean up installer
+          Remove-Item $installerPath -Force
+          
+          Write-Host "Chrome Remote Desktop installed successfully"
 
-      - name: Get Runner IP Address
+      - name: Start Chrome Remote Desktop Host
         run: |
-          $ipAddress = (Test-NetConnection -ComputerName ifconfig.me -Port 443).RemoteAddress
-          echo "RUNNER_IP=$ipAddress" >> $env:GITHUB_ENV
-          Write-Host "Runner Public IP: $ipAddress"
+          # Set computer name
+          $computerName = "github-runner-$env:GITHUB_RUN_ID"
+          
+          # Start Chrome Remote Desktop with your provided code
+          & "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
+            --code="4/0ATX87lP2pNUUI0tTC3y4gutGNuyYqAtslXALeql2hbN7hNKJyywLfTkkxQl_D8DdebUvgA" `
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+            --name=$computerName
+          
+          Write-Host "Chrome Remote Desktop started with computer name: $computerName"
+          
+          # Wait a bit for the service to initialize
+          Start-Sleep -Seconds 10
 
-      - name: Set Up SSH Tunnel Instructions
+      - name: Verify Chrome Remote Desktop Status
         run: |
-          Write-Host "`n=== SSH TUNNEL SETUP ==="
-          Write-Host "1. First, set up IAP TCP forwarding in Google Cloud Console:"
-          Write-Host "   gcloud compute ssh ${{ secrets.GCP_VM_NAME }} --zone=${{ secrets.GCP_ZONE }} --project=${{ secrets.GCP_PROJECT }} --tunnel-through-iap -- -L 13389:localhost:3389"
-          Write-Host ""
-          Write-Host "2. Then connect to RDP using:"
-          Write-Host "   Address: localhost:13389"
-          Write-Host "   Username: RDP"
-          Write-Host "   Password: MR.English2008"
-          Write-Host ""
-          Write-Host "3. Or use direct SSH (if firewall allows):"
-          Write-Host "   ssh RDP@$env:RUNNER_IP"
-          Write-Host "   Password: MR.English2008"
-          Write-Host "=========================`n"
+          # Check if Chrome Remote Desktop service is running
+          $service = Get-Service -Name "chromoting" -ErrorAction SilentlyContinue
+          
+          if ($service -and $service.Status -eq "Running") {
+              Write-Host "✅ Chrome Remote Desktop service is running"
+          } else {
+              Write-Host "⚠️ Chrome Remote Desktop service not found or not running"
+          }
 
       - name: Maintain Connection + Watch RDP User
         run: |
+          Write-Host "`n=== CHROME REMOTE DESKTOP ACCESS ==="
+          Write-Host "Access via: https://remotedesktop.google.com/access"
+          Write-Host "Computer Name: github-runner-$env:GITHUB_RUN_ID"
+          Write-Host "RDP Username: RDP"
+          Write-Host "RDP Password: MR.English2008"
+          Write-Host "===============================`n"
+
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
@@ -118,13 +129,9 @@ jobs:
               }
           }
 
-          # Display connection info continuously
+          # Keep runner alive
           while ($true) {
-              Write-Host "`n=== CONNECTION STATUS ==="
-              Write-Host "Public IP: $env:RUNNER_IP"
-              Write-Host "SSH Port: 22"
-              Write-Host "RDP Port (local only): 3389"
-              Write-Host "=========================="
-              Write-Host "[$(Get-Date)] Runner active. Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] Chrome Remote Desktop Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "Access your machine at: https://remotedesktop.google.com/access"
               Start-Sleep -Seconds 300
           }
