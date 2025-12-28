@@ -48,90 +48,182 @@ jobs:
 
       - name: Install Chrome Remote Desktop
         run: |
+          # First, download and install Chrome
+          $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          $chromePath = "$env:TEMP\chrome_installer.exe"
+          
+          Write-Host "Installing Google Chrome..."
+          Invoke-WebRequest -Uri $chromeUrl -OutFile $chromePath
+          Start-Process -FilePath $chromePath -ArgumentList "/silent", "/install" -Wait
+          Remove-Item $chromePath -Force
+          
+          # Install Chrome Remote Desktop
           $crUrl = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
           $installerPath = "$env:TEMP\chromeremotedesktophost.msi"
           
-          # Download Chrome Remote Desktop Host MSI
+          Write-Host "Installing Chrome Remote Desktop..."
           Invoke-WebRequest -Uri $crUrl -OutFile $installerPath
           
-          # Install silently
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          # Install with logging for debugging
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/l*v", "$env:TEMP\crd_install.log" -Wait
           
           # Clean up installer
           Remove-Item $installerPath -Force
           
-          Write-Host "Chrome Remote Desktop installed successfully"
+          Write-Host "Chrome Remote Desktop installation completed"
 
-      - name: Start Chrome Remote Desktop Host
+      - name: Start Chrome Remote Desktop Host via Scheduled Task
         run: |
+          # Create a PowerShell script to start Chrome Remote Desktop
+          $psScript = @'
+          # Wait for RDP user session to be ready
+          Start-Sleep -Seconds 10
+
           # Set computer name
           $computerName = "github-runner-$env:GITHUB_RUN_ID"
           
-          # Start Chrome Remote Desktop with your provided code
-          & "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
-            --code="4/0ATX87lP2pNUUI0tTC3y4gutGNuyYqAtslXALeql2hbN7hNKJyywLfTkkxQl_D8DdebUvgA" `
-            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
-            --name=$computerName
+          Write-Host "Starting Chrome Remote Desktop as $computerName..."
           
-          Write-Host "Chrome Remote Desktop started with computer name: $computerName"
-          
-          # Wait a bit for the service to initialize
-          Start-Sleep -Seconds 10
-
-      - name: Verify Chrome Remote Desktop Status
-        run: |
-          # Check if Chrome Remote Desktop service is running
-          $service = Get-Service -Name "chromoting" -ErrorAction SilentlyContinue
-          
-          if ($service -and $service.Status -eq "Running") {
-              Write-Host "✅ Chrome Remote Desktop service is running"
-          } else {
-              Write-Host "⚠️ Chrome Remote Desktop service not found or not running"
+          # Start Chrome Remote Desktop with elevated privileges
+          try {
+              & "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
+                --code="4/0ATX87lP2pNUUI0tTC3y4gutGNuyYqAtslXALeql2hbN7hNKJyywLfTkkxQl_D8DdebUvgA" `
+                --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+                --name=$computerName
+              
+              Write-Host "Chrome Remote Desktop started successfully"
+          } catch {
+              Write-Host "Error starting Chrome Remote Desktop: $_"
+              exit 1
           }
+'@
+          
+          # Save the script
+          $scriptPath = "C:\StartChromeRD.ps1"
+          $psScript | Out-File -FilePath $scriptPath -Encoding UTF8
+          
+          # Create a scheduled task to run as the RDP user
+          $taskName = "StartChromeRD"
+          
+          # Delete task if it already exists
+          schtasks /delete /tn $taskName /f 2>$null
+          
+          # Create new task to run once when RDP user logs in
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`""
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+          
+          # Create task to run as SYSTEM with highest privileges
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
+            -Description "Start Chrome Remote Desktop" -RunLevel Highest -Force
+          
+          Write-Host "Scheduled task created. Chrome RD will start on user login."
 
-      - name: Maintain Connection + Watch RDP User
+      - name: Setup Downloads.bat and Auto-login
         run: |
-          Write-Host "`n=== CHROME REMOTE DESKTOP ACCESS ==="
-          Write-Host "Access via: https://remotedesktop.google.com/access"
-          Write-Host "Computer Name: github-runner-$env:GITHUB_RUN_ID"
-          Write-Host "RDP Username: RDP"
-          Write-Host "RDP Password: MR.English2008"
-          Write-Host "===============================`n"
+          # Enable auto-logon for RDP user
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          Set-ItemProperty -Path $regPath -Name "AutoAdminLogon" -Value "1" -Type String
+          Set-ItemProperty -Path $regPath -Name "DefaultUserName" -Value "RDP" -Type String
+          Set-ItemProperty -Path $regPath -Name "DefaultPassword" -Value "MR.English2008" -Type String
+          Set-ItemProperty -Path $regPath -Name "ForceAutoLogon" -Value "1" -Type String
+          
+          Write-Host "Auto-logon configured for RDP user"
 
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+      - name: Prepare Startup Script for RDP User
+        run: |
+          # Create the Downloads.bat in system startup folder (will be copied to user folder on login)
+          $systemStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
-
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "✅ Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "✅ Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
+          $downloadPath = "$systemStartup\Downloads.bat"
+          
+          # Download the batch file to system startup
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+          Write-Host "✅ Downloads.bat placed in system startup folder"
+          
+          # Also create a PowerShell script to copy it to RDP user's startup on login
+          $copyScript = @'
+          # Wait for RDP user profile to be created
+          $rdpProfile = "C:\Users\RDP"
+          $userStartup = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $systemStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Downloads.bat"
+          
+          while (-not (Test-Path $rdpProfile)) {
+              Start-Sleep -Seconds 5
           }
+          
+          # Create user startup folder
+          New-Item -ItemType Directory -Path $userStartup -Force | Out-Null
+          
+          # Copy Downloads.bat to user startup
+          Copy-Item -Path $systemStartup -Destination "$userStartup\Downloads.bat" -Force
+          
+          # Execute Downloads.bat
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$userStartup\Downloads.bat`"" -Wait
+          
+          Write-Host "Downloads.bat copied and executed successfully"
+'@
+          
+          $copyScriptPath = "C:\CopyDownloads.ps1"
+          $copyScript | Out-File -FilePath $copyScriptPath -Encoding UTF8
+          
+          # Create task to run the copy script on user login
+          $taskName = "CopyDownloadsOnLogin"
+          schtasks /delete /tn $taskName /f 2>$null
+          
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$copyScriptPath`""
+          $trigger = New-ScheduledTaskTrigger -AtLogon
+          $principal = New-ScheduledTaskPrincipal -UserId "RDP" -LogonType Interactive -RunLevel Highest
+          
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
+            -Description "Copy Downloads.bat on RDP user login" -Force
+          
+          Write-Host "Scheduled task created to copy Downloads.bat on RDP user login"
 
-          # Keep runner alive
+      - name: Display Connection Information
+        run: |
+          Write-Host "`n=============================================="
+          Write-Host "        CHROME REMOTE DESKTOP SETUP"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "ACCESS INSTRUCTIONS:"
+          Write-Host "1. Go to: https://remotedesktop.google.com/access"
+          Write-Host "2. Look for computer: github-runner-$env:GITHUB_RUN_ID"
+          Write-Host ""
+          Write-Host "ALTERNATIVE RDP ACCESS (if Chrome RD fails):"
+          Write-Host "RDP Address: [Windows RDP via GitHub runner]"
+          Write-Host "Username: RDP"
+          Write-Host "Password: MR.English2008"
+          Write-Host ""
+          Write-Host "AUTO-INSTALLED ON STARTUP:"
+          Write-Host "- Downloads.bat from your GitLab repository"
+          Write-Host "- Chrome Remote Desktop host service"
+          Write-Host "==============================================`n"
+
+      - name: Keep Runner Alive
+        run: |
+          # Log some system info
+          Write-Host "System Information:"
+          Get-Service -Name "chromoting" -ErrorAction SilentlyContinue | Select-Object Name, Status | Format-Table
+          Write-Host ""
+          
+          # Keep the runner alive
+          $counter = 0
           while ($true) {
-              Write-Host "[$(Get-Date)] Chrome Remote Desktop Active - Use Ctrl+C in workflow to terminate"
-              Write-Host "Access your machine at: https://remotedesktop.google.com/access"
+              $counter++
+              Write-Host "[$(Get-Date)] Chrome Remote Desktop runner active - Iteration $counter"
+              Write-Host "Machine should appear at: https://remotedesktop.google.com/access"
+              Write-Host "Press Ctrl+C in workflow to terminate"
+              Write-Host ""
+              
+              # Check if Chrome Remote Desktop service is running
+              $service = Get-Service -Name "chromoting" -ErrorAction SilentlyContinue
+              if ($service -and $service.Status -eq "Running") {
+                  Write-Host "✅ Chrome Remote Desktop service is running"
+              } else {
+                  Write-Host "⚠️ Chrome Remote Desktop service not running - attempting to start..."
+                  Start-Service -Name "chromoting" -ErrorAction SilentlyContinue
+              }
+              
               Start-Sleep -Seconds 300
           }
