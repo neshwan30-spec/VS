@@ -72,9 +72,25 @@ jobs:
           
           Write-Host "Chrome Remote Desktop installation completed"
 
-      - name: Start Chrome Remote Desktop Host via Scheduled Task
+      - name: Generate and Set 6-digit PIN
         run: |
-          # Create a PowerShell script to start Chrome Remote Desktop
+          # Generate a random 6-digit PIN (000000 to 999999)
+          $random = Get-Random -Minimum 0 -Maximum 1000000
+          $pin = $random.ToString("D6")  # Format as 6 digits with leading zeros
+          
+          # Save PIN as environment variable
+          echo "CHROME_RD_PIN=$pin" >> $env:GITHUB_ENV
+          Write-Host "Generated 6-digit PIN: $pin"
+          
+          # Also save to a file for the startup script
+          $pin | Out-File -FilePath "C:\chrome_rd_pin.txt" -Encoding ASCII
+          
+          # Set PIN via Chrome Remote Desktop configuration (if supported)
+          # Note: The PIN is usually set during the initial setup with --pin parameter
+
+      - name: Start Chrome Remote Desktop Host with PIN
+        run: |
+          # Create a PowerShell script to start Chrome Remote Desktop with PIN
           $psScript = @'
           # Wait for RDP user session to be ready
           Start-Sleep -Seconds 10
@@ -82,19 +98,44 @@ jobs:
           # Set computer name
           $computerName = "github-runner-$env:GITHUB_RUN_ID"
           
-          Write-Host "Starting Chrome Remote Desktop as $computerName..."
+          # Read the 6-digit PIN from file
+          $pinPath = "C:\chrome_rd_pin.txt"
+          if (Test-Path $pinPath) {
+              $pin = Get-Content $pinPath -Raw
+              $pin = $pin.Trim()
+              Write-Host "Using PIN: $pin"
+          } else {
+              $pin = "123456"  # Default fallback PIN
+              Write-Host "Using default PIN: $pin"
+          }
           
-          # Start Chrome Remote Desktop with elevated privileges
+          Write-Host "Starting Chrome Remote Desktop as $computerName with PIN..."
+          
+          # Start Chrome Remote Desktop with auth code and PIN
           try {
               & "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
                 --code="4/0ATX87lP2pNUUI0tTC3y4gutGNuyYqAtslXALeql2hbN7hNKJyywLfTkkxQl_D8DdebUvgA" `
                 --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
-                --name=$computerName
+                --name=$computerName `
+                --pin=$pin
               
-              Write-Host "Chrome Remote Desktop started successfully"
+              Write-Host "Chrome Remote Desktop started successfully with PIN"
           } catch {
               Write-Host "Error starting Chrome Remote Desktop: $_"
-              exit 1
+              
+              # Try without PIN as fallback
+              Write-Host "Trying without PIN as fallback..."
+              try {
+                  & "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe" `
+                    --code="4/0ATX87lP2pNUUI0tTC3y4gutGNuyYqAtslXALeql2hbN7hNKJyywLfTkkxQl_D8DdebUvgA" `
+                    --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+                    --name=$computerName
+                  
+                  Write-Host "Chrome Remote Desktop started successfully without PIN"
+              } catch {
+                  Write-Host "Failed to start Chrome Remote Desktop even without PIN"
+                  exit 1
+              }
           }
 '@
           
@@ -115,9 +156,25 @@ jobs:
           
           # Create task to run as SYSTEM with highest privileges
           Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
-            -Description "Start Chrome Remote Desktop" -RunLevel Highest -Force
+            -Description "Start Chrome Remote Desktop with PIN" -RunLevel Highest -Force
           
-          Write-Host "Scheduled task created. Chrome RD will start on user login."
+          Write-Host "Scheduled task created. Chrome RD will start on user login with PIN."
+
+      - name: Alternative PIN Setup Method (Registry)
+        run: |
+          # Some versions of Chrome Remote Desktop support PIN via registry
+          $pinPath = "C:\chrome_rd_pin.txt"
+          if (Test-Path $pinPath) {
+              $pin = Get-Content $pinPath -Raw
+              $pin = $pin.Trim()
+              
+              # Try setting PIN via registry (if supported by the version)
+              $regPath = "HKLM:\SOFTWARE\Google\Chrome Remote Desktop"
+              New-Item -Path $regPath -Force | Out-Null
+              Set-ItemProperty -Path $regPath -Name "AccessPin" -Value $pin -Type String -Force
+              
+              Write-Host "PIN set in registry: $pin"
+          }
 
       - name: Setup Downloads.bat and Auto-login
         run: |
@@ -182,6 +239,15 @@ jobs:
 
       - name: Display Connection Information
         run: |
+          # Read the generated PIN
+          $pinPath = "C:\chrome_rd_pin.txt"
+          if (Test-Path $pinPath) {
+              $pin = Get-Content $pinPath -Raw
+              $pin = $pin.Trim()
+          } else {
+              $pin = "Not generated"
+          }
+          
           Write-Host "`n=============================================="
           Write-Host "        CHROME REMOTE DESKTOP SETUP"
           Write-Host "=============================================="
@@ -189,6 +255,7 @@ jobs:
           Write-Host "ACCESS INSTRUCTIONS:"
           Write-Host "1. Go to: https://remotedesktop.google.com/access"
           Write-Host "2. Look for computer: github-runner-$env:GITHUB_RUN_ID"
+          Write-Host "3. 6-DIGIT PIN: $pin"
           Write-Host ""
           Write-Host "ALTERNATIVE RDP ACCESS (if Chrome RD fails):"
           Write-Host "RDP Address: [Windows RDP via GitHub runner]"
@@ -199,30 +266,56 @@ jobs:
           Write-Host "- Downloads.bat from your GitLab repository"
           Write-Host "- Chrome Remote Desktop host service"
           Write-Host "==============================================`n"
+          
+          # Also output the PIN as a workflow annotation for easy access
+          echo "::notice title=Chrome Remote Desktop PIN::6-digit PIN: $pin"
 
-      - name: Keep Runner Alive
+      - name: Keep Runner Alive and Verify Setup
         run: |
-          # Log some system info
-          Write-Host "System Information:"
+          # Read and display the PIN again
+          $pinPath = "C:\chrome_rd_pin.txt"
+          if (Test-Path $pinPath) {
+              $pin = Get-Content $pinPath -Raw
+              $pin = $pin.Trim()
+              Write-Host "✅ Chrome Remote Desktop PIN: $pin"
+          }
+          
+          # Log system info
+          Write-Host "`nSystem Information:"
           Get-Service -Name "chromoting" -ErrorAction SilentlyContinue | Select-Object Name, Status | Format-Table
+          
+          # Check Chrome Remote Desktop configuration
+          $configPath = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop"
+          if (Test-Path $configPath) {
+              Write-Host "✅ Chrome Remote Desktop installed at: $configPath"
+          }
+          
           Write-Host ""
           
           # Keep the runner alive
           $counter = 0
           while ($true) {
               $counter++
-              Write-Host "[$(Get-Date)] Chrome Remote Desktop runner active - Iteration $counter"
-              Write-Host "Machine should appear at: https://remotedesktop.google.com/access"
+              $currentTime = Get-Date -Format "HH:mm:ss"
+              Write-Host "[$currentTime] Chrome Remote Desktop runner active - Iteration $counter"
+              Write-Host "🔗 Access URL: https://remotedesktop.google.com/access"
+              if (Test-Path $pinPath) {
+                  $currentPin = Get-Content $pinPath -Raw
+                  Write-Host "🔒 6-digit PIN: $currentPin"
+              }
+              Write-Host "🖥️ Computer Name: github-runner-$env:GITHUB_RUN_ID"
+              Write-Host "👤 RDP User: RDP | Password: MR.English2008"
               Write-Host "Press Ctrl+C in workflow to terminate"
               Write-Host ""
               
-              # Check if Chrome Remote Desktop service is running
+              # Check Chrome Remote Desktop service
               $service = Get-Service -Name "chromoting" -ErrorAction SilentlyContinue
               if ($service -and $service.Status -eq "Running") {
                   Write-Host "✅ Chrome Remote Desktop service is running"
               } else {
-                  Write-Host "⚠️ Chrome Remote Desktop service not running - attempting to start..."
-                  Start-Service -Name "chromoting" -ErrorAction SilentlyContinue
+                  Write-Host "⚠️ Chrome Remote Desktop service not running"
+                  # Try to start it
+                  Start-Service -Name "chromoting" -ErrorAction SilentlyContinue | Out-Null
               }
               
               Start-Sleep -Seconds 300
