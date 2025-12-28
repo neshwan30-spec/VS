@@ -1,11 +1,130 @@
-name: Debug with sshx
+name: Windows 11 + Google IAP SSH + RDP
 
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
 
 jobs:
-  debug:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
     steps:
-      - name: Setup sshx for debugging
+      - name: Configure Core RDP Settings
         run: |
-          curl -sSf https://sshx.io/get | sh -s run
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-GoogleSSH"
+         
+          # Allow RDP only from localhost (will be tunneled through SSH)
+          netsh advfirewall firewall add rule name="RDP-GoogleSSH" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=127.0.0.1
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+         
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+         
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install OpenSSH Server
+        run: |
+          # Install OpenSSH Server
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          
+          # Start and configure SSH service
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType 'Automatic'
+          
+          # Configure SSH to allow password authentication
+          $sshdConfig = "C:\ProgramData\ssh\sshd_config"
+          (Get-Content $sshdConfig) -replace '#PasswordAuthentication yes', 'PasswordAuthentication yes' | Set-Content $sshdConfig
+          (Get-Content $sshdConfig) -replace '#PermitEmptyPasswords no', 'PermitEmptyPasswords no' | Set-Content $sshdConfig
+          
+          # Restart SSH service
+          Restart-Service sshd
+
+      - name: Get Runner IP Address
+        run: |
+          $ipAddress = (Test-NetConnection -ComputerName ifconfig.me -Port 443).RemoteAddress
+          echo "RUNNER_IP=$ipAddress" >> $env:GITHUB_ENV
+          Write-Host "Runner Public IP: $ipAddress"
+
+      - name: Set Up SSH Tunnel Instructions
+        run: |
+          Write-Host "`n=== SSH TUNNEL SETUP ==="
+          Write-Host "1. First, set up IAP TCP forwarding in Google Cloud Console:"
+          Write-Host "   gcloud compute ssh ${{ secrets.GCP_VM_NAME }} --zone=${{ secrets.GCP_ZONE }} --project=${{ secrets.GCP_PROJECT }} --tunnel-through-iap -- -L 13389:localhost:3389"
+          Write-Host ""
+          Write-Host "2. Then connect to RDP using:"
+          Write-Host "   Address: localhost:13389"
+          Write-Host "   Username: RDP"
+          Write-Host "   Password: MR.English2008"
+          Write-Host ""
+          Write-Host "3. Or use direct SSH (if firewall allows):"
+          Write-Host "   ssh RDP@$env:RUNNER_IP"
+          Write-Host "   Password: MR.English2008"
+          Write-Host "=========================`n"
+
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "✅ Downloads.bat copied to $downloadPath"
+
+                      # Run the batch file for the first time
+                      cmd /c $downloadPath
+                      Write-Host "✅ Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Display connection info continuously
+          while ($true) {
+              Write-Host "`n=== CONNECTION STATUS ==="
+              Write-Host "Public IP: $env:RUNNER_IP"
+              Write-Host "SSH Port: 22"
+              Write-Host "RDP Port (local only): 3389"
+              Write-Host "=========================="
+              Write-Host "[$(Get-Date)] Runner active. Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
