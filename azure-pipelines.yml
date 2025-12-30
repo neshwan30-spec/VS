@@ -1,53 +1,34 @@
-# Install necessary packages
-!apt-get update
-!apt-get install -y qemu qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager x11vnc xvfb curl jq
+// rumble-tester.ts - Deno version
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
-# Download ngrok
-!curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null \
-    && echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list \
-    && sudo apt update && sudo apt install ngrok
-
-# Write the updated ngrok.yml configuration file with the version property
-ngrok_config = """
-version: "3"
-agent:
-  authtoken: 2lTl1Kk5yvgih1829aw46Fdhd5L_36DyEvA6b8esPGaJAuBHY
-"""
-with open('grok.yml', 'w') as f:
-    f.write(ngrok_config)
-
-# Download Windows 7 Live ISO
-!wget -O win10live.iso "https://archive.org/download/gandalfs-win-10-pe-x86-with-updateable-usb-apps/Gandalf%27s%20Win10PEx86_with%20updateable%20usb%20apps.ISO"
-
-# Create a virtual disk for QEMU
-!qemu-img create -f qcow2 windows_disk.qcow2 60G
-
-# Start Xvfb (X Virtual Framebuffer) to create a virtual display in the background
-get_ipython().system_raw('Xvfb :0 -screen 0 1024x768x24 > xvfb.log 2>&1 &')
-
-# Start QEMU with Xvfb
-get_ipython().system_raw('DISPLAY=:0 qemu-system-x86_64 -cdrom win7live.iso -cpu qemu64 -smp cores=2 -m 10240 -hda windows_disk.qcow2 -boot d -net nic -net user -vnc :0 -usb -device usb-tablet -vga std -daemonize > qemu.log 2>&1 &')
-
-# Start x11vnc on the virtual framebuffer
-get_ipython().system_raw('x11vnc -display :0 -forever -nopw -listen localhost -xkb -noxrecord -noxfixes -noxdamage > x11vnc.log 2>&1 &')
-
-# Start ngrok to expose VNC server
-get_ipython().system_raw('ngrok tcp 5900 --config grok.yml --log=stdout > ngrok.log 2>&1 &')
-
-# Fetch ngrok public URL for VNC
-import json
-import urllib.request
-import time
-
-time.sleep(2)
-
-try:
-    with urllib.request.urlopen("http://localhost:4040/api/tunnels") as url:
-        data = json.loads(url.read().decode())
-        ngrok_url = data['tunnels'][0]['public_url']
-        print("Ngrok public URL:", ngrok_url)
-except Exception as e:
-    print(f"Error fetching ngrok URL: {e}")
-
-# Keep the Colab session alive
-time.sleep(99999999)
+serve(async (req) => {
+  const url = new URL(req.url);
+  
+  if (url.pathname === "/test") {
+    const cookie = url.searchParams.get("cookie");
+    
+    if (!cookie) {
+      return new Response("Cookie required", { status: 400 });
+    }
+    
+    const response = await fetch(
+      "https://rumble.com/account/overview?mobile=1&app_name=com.rumble.ios.app&app_version=2.8.54.447&os_version=17.7.1&api=6",
+      {
+        headers: {
+          "Cookie": cookie,
+          "User-Agent": "Rumble-iOS/447 CFNetwork/1498.700.2 Darwin/23.6.0",
+          "Accept": "application/json"
+        }
+      }
+    );
+    
+    return new Response(JSON.stringify({
+      status: response.status,
+      data: await response.text()
+    }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+  
+  return new Response("Not found", { status: 404 });
+});
