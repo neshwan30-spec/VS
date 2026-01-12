@@ -31,31 +31,26 @@ jobs:
 
       - name: Create RDP User
         run: |
-          # Password that meets Windows complexity requirements:
-          # - At least 8 characters
-          # - Contains uppercase (D, D)
-          # - Contains lowercase (a)
-          # - Contains numbers (12345678)
-          # - Contains special character (!)
+          # Create password that meets Windows requirements
           $password = "D12345678Da!"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          try {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          } catch [Microsoft.PowerShell.Commands.InvalidPasswordException] {
-              Write-Error "Password doesn't meet complexity requirements. Try a different password."
-              exit 1
-          }
+          # Create the user
+          New-LocalUser -Name "TK***" -Password $securePass -AccountNeverExpires
           
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member "TK***"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TK***"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
+          # Verify user was created
+          if (-not (Get-LocalUser -Name "TK***" -ErrorAction SilentlyContinue)) {
               Write-Error "User creation failed"
               exit 1
           }
+          
+          # Store credentials in environment variable
+          echo "RDP_CREDS=User: TK*** | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "User TK*** created successfully"
 
       - name: Install Tailscale
         run: |
@@ -102,8 +97,8 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $((echo $env:RDP_CREDS) -split ':')[2])"
+          Write-Host "Username: TK***"
+          Write-Host "Password: D12345678Da!"
           Write-Host "==================`n"
           
           # Keep runner active indefinitely (or until manually cancelled)
