@@ -1,53 +1,220 @@
-# Install necessary packages
-!apt-get update
-!apt-get install -y qemu qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager x11vnc xvfb curl jq
+name: RDP Auto Connect
 
-# Download ngrok
-!curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null \
-    && echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list \
-    && sudo apt update && sudo apt install ngrok
+on:
+  workflow_dispatch:
 
-# Write the updated ngrok.yml configuration file with the version property
-ngrok_config = """
-version: "3"
-agent:
-  authtoken: 2lTl1Kk5yvgih1829aw46Fdhd5L_36DyEvA6b8esPGaJAuBHY
-"""
-with open('grok.yml', 'w') as f:
-    f.write(ngrok_config)
+jobs:
+  auto-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
-# Download Windows 7 Live ISO
-!wget -O win10live.iso "https://archive.org/download/gandalfs-win-10-pe-x86-with-updateable-usb-apps/Gandalf%27s%20Win10PEx86_with%20updateable%20usb%20apps.ISO"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-# Create a virtual disk for QEMU
-!qemu-img create -f qcow2 windows_disk.qcow2 60G
+      - name: Configure RDP Settings
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable NLA for easier connection
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          
+          # Configure firewall
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          
+          Restart-Service TermService -Force
 
-# Start Xvfb (X Virtual Framebuffer) to create a virtual display in the background
-get_ipython().system_raw('Xvfb :0 -screen 0 1024x768x24 > xvfb.log 2>&1 &')
+      - name: Create Auto-Login User
+        run: |
+          # Create secure password
+          $password = "AutoRDP@$(Get-Date -Format 'MMdd')!"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name "AutoRDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "AutoRDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AutoRDP"
+          
+          # Enable auto-logon
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          Set-ItemProperty -Path $regPath -Name "AutoAdminLogon" -Value "1"
+          Set-ItemProperty -Path $regPath -Name "DefaultUserName" -Value "AutoRDP"
+          Set-ItemProperty -Path $regPath -Name "DefaultPassword" -Value $password
+          
+          echo "RDP_CREDS=User: AutoRDP | Password: $password" >> $env:GITHUB_ENV
 
-# Start QEMU with Xvfb
-get_ipython().system_raw('DISPLAY=:0 qemu-system-x86_64 -cdrom win7live.iso -cpu qemu64 -smp cores=2 -m 10240 -hda windows_disk.qcow2 -boot d -net nic -net user -vnc :0 -usb -device usb-tablet -vga std -daemonize > qemu.log 2>&1 &')
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          msiexec.exe /i "$installerPath" /quiet /norestart
+          Remove-Item $installerPath -Force
 
-# Start x11vnc on the virtual framebuffer
-get_ipython().system_raw('x11vnc -display :0 -forever -nopw -listen localhost -xkb -noxrecord -noxfixes -noxdamage > x11vnc.log 2>&1 &')
+      - name: Connect Tailscale
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-auto-rdp-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $attempts = 0
+          while (-not $tsIP -and $attempts -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 2
+              $attempts++
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
 
-# Start ngrok to expose VNC server
-get_ipython().system_raw('ngrok tcp 5900 --config grok.yml --log=stdout > ngrok.log 2>&1 &')
+      - name: Create Auto-Connect Script
+        run: |
+          # Create PowerShell script to auto-connect
+          $rdpScript = @'
+# Auto RDP Connection Script
+$tsIP = "$env:TAILSCALE_IP"
+$username = "AutoRDP"
+$password = "$password"
 
-# Fetch ngrok public URL for VNC
-import json
-import urllib.request
-import time
+Write-Host "========================================"
+Write-Host "RDP Auto-Connect Information:"
+Write-Host "Address: $tsIP"
+Write-Host "Username: $username"
+Write-Host "Password: $password"
+Write-Host "========================================"
 
-time.sleep(2)
+# Create RDP file
+$rdpContent = @"
+screen mode id:i:2
+use multimon:i:0
+desktopwidth:i:1920
+desktopheight:i:1080
+session bpp:i:32
+winposstr:s:0,1,0,0,800,600
+compression:i:1
+keyboardhook:i:2
+audiocapturemode:i:0
+videoplaybackmode:i:1
+connection type:i:7
+networkautodetect:i:1
+bandwidthautodetect:i:1
+displayconnectionbar:i:1
+enableworkspacereconnect:i:0
+disable wallpaper:i:0
+allow font smoothing:i:0
+allow desktop composition:i:0
+disable full window drag:i:1
+disable menu anims:i:1
+disable themes:i:0
+disable cursor setting:i:0
+bitmapcachepersistenable:i:1
+full address:s:$tsIP
+audiomode:i:0
+redirectprinters:i:1
+redirectcomports:i:0
+redirectsmartcards:i:1
+redirectclipboard:i:1
+redirectposdevices:i:0
+autoreconnection enabled:i:1
+authentication level:i:0
+prompt for credentials:i:0
+negotiate security layer:i:0
+remoteapplicationmode:i:0
+alternate shell:s:
+shell working directory:s:
+gatewayhostname:s:
+gatewayusagemethod:i:4
+gatewaycredentialssource:i:4
+gatewayprofileusagemethod:i:0
+promptcredentialonce:i:0
+use redirection server name:i:0
+"@
 
-try:
-    with urllib.request.urlopen("http://localhost:4040/api/tunnels") as url:
-        data = json.loads(url.read().decode())
-        ngrok_url = data['tunnels'][0]['public_url']
-        print("Ngrok public URL:", ngrok_url)
-except Exception as e:
-    print(f"Error fetching ngrok URL: {e}")
+$rdpPath = "$env:TEMP\auto_connect.rdp"
+$rdpContent | Out-File -FilePath $rdpPath -Encoding ASCII
+Write-Host "RDP file created at: $rdpPath"
 
-# Keep the Colab session alive
-time.sleep(99999999)
+# Create shortcut for easy connection
+$shortcutPath = "$env:USERPROFILE\Desktop\Connect_RDP.lnk"
+$WScriptShell = New-Object -ComObject WScript.Shell
+$shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = "mstsc.exe"
+$shortcut.Arguments = "/v:$tsIP"
+$shortcut.Save()
+
+Write-Host "Shortcut created on desktop"
+Write-Host ""
+Write-Host "To connect automatically, run:"
+Write-Host "cmdkey /generic:$tsIP /user:AutoRDP /pass:$password"
+Write-Host "mstsc /v:$tsIP"
+'@
+          
+          # Save script
+          $scriptPath = "$env:TEMP\auto_connect_rdp.ps1"
+          $rdpScript | Out-File -FilePath $scriptPath -Encoding UTF8
+          
+          # Create connection instructions file
+          $instructions = @"
+========================================
+AUTO RDP CONNECTION
+========================================
+
+Method 1: Using mstsc.exe
+-------------------------
+1. Open Run (Win+R)
+2. Type: mstsc /v:$env:TAILSCALE_IP
+3. Username: AutoRDP
+4. Password: $password
+
+Method 2: Save credentials
+--------------------------
+Run these commands in PowerShell:
+cmdkey /generic:$env:TAILSCALE_IP /user:AutoRDP /pass:$password
+mstsc /v:$env:TAILSCALE_IP
+
+Method 3: Use RDP file
+----------------------
+RDP file saved at: $env:TEMP\auto_connect.rdp
+Double-click to connect automatically.
+
+========================================
+IMPORTANT: This RDP session will expire when workflow is cancelled!
+========================================
+"@
+          
+          $instructions | Out-File "$env:TEMP\rdp_instructions.txt"
+          echo "INSTRUCTIONS_FILE=$env:TEMP\rdp_instructions.txt" >> $env:GITHUB_ENV
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "========================================"
+          Write-Host "🎯 RDP AUTO-CONNECT READY!"
+          Write-Host "========================================"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: AutoRDP"
+          Write-Host "Password: AutoRDP@$(Get-Date -Format 'MMdd')!"
+          Write-Host ""
+          Write-Host "Quick connect command:"
+          Write-Host "mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "To auto-fill credentials, run first:"
+          Write-Host "cmdkey /generic:$env:TAILSCALE_IP /user:AutoRDP /pass:AutoRDP@$(Get-Date -Format 'MMdd')!"
+          Write-Host "========================================"
+
+      - name: Keep Alive
+        run: |
+          # Create a keep-alive script that also helps users connect
+          while ($true) {
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] RDP Session Active"
+              Write-Host "Connect via: mstsc /v:$env:TAILSCALE_IP"
+              Write-Host "Username: AutoRDP | Password: AutoRDP@$(Get-Date -Format 'MMdd')!"
+              Write-Host "Press Ctrl+C in GitHub Actions to stop this session"
+              Write-Host "-" * 50
+              Start-Sleep -Seconds 60
+          }
