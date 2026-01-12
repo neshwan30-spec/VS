@@ -1,46 +1,202 @@
-name: Secure Tailscale Setup
+name: Windows Tailscale Setup
 
 on:
   workflow_dispatch:
-    inputs:
-      use_temp_token:
-        description: 'Use temporary token'
-        type: boolean
-        default: true
+  push:
+    branches: [ main, master ]
+
+env:
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
+  TAILSCALE_HOSTNAME: github-win-${{ github.run_number }}
 
 jobs:
-  setup:
+  setup-tailscale:
     runs-on: windows-latest
     
     steps:
-    - name: Checkout
+    - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Get Tailscale Token (Secure)
-      id: get-token
+    - name: Validate Secrets
       shell: powershell
       run: |
-        # Prefer ephemeral tokens for CI/CD
-        $token = "${{ secrets.TAILSCALE_EPHEMERAL_TOKEN }}"
-        
-        if ([string]::IsNullOrEmpty($token)) {
-          # Fallback to regular token
-          $token = "${{ secrets.TAILSCALE_AUTH_TOKEN }}"
+        # Check if secret is set (without exposing it)
+        if ([string]::IsNullOrEmpty($env:TAILSCALE_AUTHKEY)) {
+          Write-Error "❌ TAILSCALE_AUTH_TOKEN secret is not set!"
+          Write-Host "Please add your Tailscale auth token to GitHub Secrets:"
+          Write-Host "1. Go to Repository Settings > Secrets > Actions"
+          Write-Host "2. Add secret named: TAILSCALE_AUTH_TOKEN"
+          Write-Host "3. Get token from: https://login.tailscale.com/admin/settings/keys"
+          exit 1
+        } else {
+          # Safely show first few characters without exposing full token
+          $tokenLength = $env:TAILSCALE_AUTHKEY.Length
+          $showLength = [Math]::Min(10, $tokenLength)
+          if ($tokenLength -gt 0) {
+            $prefix = $env:TAILSCALE_AUTHKEY.Substring(0, $showLength)
+            Write-Host "✓ TAILSCALE_AUTH_TOKEN is set (first $showLength chars: ${prefix}...)"
+          } else {
+            Write-Host "✓ TAILSCALE_AUTH_TOKEN is set (empty)"
+          }
         }
         
-        if ([string]::IsNullOrEmpty($token)) {
-          Write-Error "No Tailscale token found in secrets!"
+    - name: Install Tailscale
+      shell: powershell
+      run: |
+        Write-Host "Installing Tailscale..."
+        
+        # Method 1: Direct MSI install (most reliable)
+        try {
+          Write-Host "Installing via msiexec..."
+          Start-Process msiexec -ArgumentList "/i `"https://pkgs.tailscale.com/stable/tailscale-setup.msi`" /quiet /norestart" -Wait -NoNewWindow
+          
+          # Wait for installation
+          Start-Sleep -Seconds 15
+          
+          if (Test-Path "C:\Program Files\Tailscale\tailscale.exe") {
+            Write-Host "✓ Tailscale installed successfully"
+          } else {
+            Write-Host "⚠️ Checking alternative locations..."
+            
+            # Check other possible locations
+            $paths = @(
+              "C:\Program Files\Tailscale\tailscale.exe",
+              "C:\Program Files (x86)\Tailscale\tailscale.exe",
+              "${env:ProgramFiles}\Tailscale\tailscale.exe"
+            )
+            
+            $found = $false
+            foreach ($path in $paths) {
+              if (Test-Path $path) {
+                Write-Host "Found at: $path"
+                $found = $true
+                break
+              }
+            }
+            
+            if (-not $found) {
+              Write-Host "❌ Tailscale not found after installation"
+            }
+          }
+        } catch {
+          Write-Host "MSI install failed: $_"
+          Write-Host "Trying alternative method..."
+        }
+        
+    - name: Connect to Tailscale
+      shell: powershell
+      run: |
+        Write-Host "Connecting to Tailscale..."
+        
+        # Find Tailscale executable
+        $tailscaleExe = $null
+        $possiblePaths = @(
+          "C:\Program Files\Tailscale\tailscale.exe",
+          "C:\Program Files (x86)\Tailscale\tailscale.exe",
+          "${env:ProgramFiles}\Tailscale\tailscale.exe"
+        )
+        
+        foreach ($path in $possiblePaths) {
+          if (Test-Path $path) {
+            $tailscaleExe = $path
+            Write-Host "Found Tailscale at: $path"
+            break
+          }
+        }
+        
+        if (-not $tailscaleExe) {
+          # Try in PATH
+          $tailscaleExe = Get-Command tailscale -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if ($tailscaleExe) {
+            Write-Host "Found in PATH: $tailscaleExe"
+          }
+        }
+        
+        if (-not $tailscaleExe) {
+          Write-Error "❌ Tailscale executable not found!"
           exit 1
         }
         
-        # Mask token in logs (GitHub does this automatically for secrets)
-        echo "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        # Connect with auth key
+        & $tailscaleExe up --auth-key $env:TAILSCALE_AUTHKEY --hostname $env:TAILSCALE_HOSTNAME --accept-dns
         
-    - name: Setup Tailscale
-      env:
-        TS_AUTHKEY: ${{ steps.get-token.outputs.token }}
+        Write-Host "Tailscale connection command executed..."
+        
+    - name: Wait for Connection
+      id: wait-connection
+      shell: powershell
       run: |
-        # Install and connect
-        msiexec /i "https://pkgs.tailscale.com/stable/tailscale-setup.msi" /quiet /norestart
-        timeout /t 15
-        "C:\Program Files\Tailscale\tailscale.exe" up --auth-key $env:TS_AUTHKEY
+        $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+        if (-not (Test-Path $tailscaleExe)) {
+          $tailscaleExe = "tailscale.exe"
+        }
+        
+        $maxAttempts = 12  # 60 seconds total
+        $attempt = 1
+        
+        Write-Host "Waiting for Tailscale connection..."
+        
+        while ($attempt -le $maxAttempts) {
+          Write-Host "Attempt $attempt of $maxAttempts"
+          
+          try {
+            $status = & $tailscaleExe status 2>&1
+            
+            if ($status -match "Active") {
+              Write-Host "✅ Tailscale is active!"
+              
+              # Get IP address
+              $ipOutput = & $tailscaleExe ip --4 2>&1
+              if ($ipOutput -match "^\d+\.\d+\.\d+\.\d+") {
+                $tsIP = $ipOutput.Trim()
+                Write-Host "Tailscale IP: $tsIP"
+                
+                # Set outputs
+                echo "ts_ip=$tsIP" >> $env:GITHUB_OUTPUT
+                echo "status=connected" >> $env:GITHUB_OUTPUT
+              }
+              
+              # Show full status
+              & $tailscaleExe status
+              
+              exit 0
+            }
+          } catch {
+            Write-Host "Error checking status: $_"
+          }
+          
+          if ($attempt -eq $maxAttempts) {
+            Write-Host "⚠️ Connection timeout"
+            echo "status=timeout" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          
+          Start-Sleep -Seconds 5
+          $attempt++
+        }
+        
+    - name: Continue Workflow
+      shell: powershell
+      run: |
+        Write-Host "Continuing workflow..."
+        Write-Host "Connection status: ${{ steps.wait-connection.outputs.status }}"
+        
+        if ("${{ steps.wait-connection.outputs.status }}" -eq "connected") {
+          Write-Host "Using Tailscale IP: ${{ steps.wait-connection.outputs.ts_ip }}"
+          # Your Tailscale-dependent tasks here
+        } else {
+          Write-Host "⚠️ Proceeding without Tailscale connection"
+          # Tasks that don't require Tailscale
+        }
+        
+    - name: Cleanup
+      if: always()
+      shell: powershell
+      run: |
+        Write-Host "Cleaning up..."
+        try {
+          & "C:\Program Files\Tailscale\tailscale.exe" down 2>$null
+          Write-Host "Tailscale disconnected"
+        } catch {
+          Write-Host "Cleanup skipped or failed"
+        }
