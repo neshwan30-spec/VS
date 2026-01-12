@@ -1,44 +1,143 @@
-name: Setup Tailscale and Wait
+name: Windows Tailscale Setup
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      timeout:
+        description: 'Timeout in seconds'
+        default: '300'
+
+env:
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
+  TAILSCALE_HOSTNAME: windows-runner-${{ github.run_id }}
 
 jobs:
-  setup-tailscale:
-    runs-on: ubuntu-latest
+  windows-tailscale:
+    runs-on: windows-latest  # Windows runner
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Install Tailscale
+    - name: Install Tailscale on Windows
+      shell: powershell
       run: |
-        curl -fsSL https://tailscale.com/install.sh | sh
-        sudo tailscale up --auth-key=${{ secrets.TAILSCALE_AUTH_TOKEN }}
+        # Download and install Tailscale
+        Write-Host "Installing Tailscale..."
+        $tailscaleInstaller = "TailscaleSetup.exe"
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/TailscaleSetup.exe" -OutFile $tailscaleInstaller
         
-    - name: Wait for Tailscale to be ready
+        # Silent install
+        Start-Process -FilePath .\$tailscaleInstaller -ArgumentList "/S" -Wait
+        Remove-Item $tailscaleInstaller
+        
+        # Add Tailscale to PATH
+        $tailscalePath = "$env:ProgramFiles\Tailscale"
+        $env:Path = "$tailscalePath;" + $env:Path
+        [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine)
+        
+    - name: Start Tailscale with Auth Key
+      shell: powershell
       run: |
-        max_attempts=30
-        attempt=1
+        Write-Host "Starting Tailscale..."
         
-        while [ $attempt -le $max_attempts ]; do
-          echo "Checking Tailscale status (attempt $attempt/$max_attempts)..."
-          
-          if tailscale status --json | grep -q '"BackendState":"Running"'; then
-            echo "✓ Tailscale is running!"
-            echo "IP address: $(tailscale ip --4)"
-            break
-          fi
-          
-          if [ $attempt -eq $max_attempts ]; then
-            echo "✗ Tailscale failed to start within timeout"
-            tailscale status
-            exit 1
-          fi
-          
-          echo "Waiting 5 seconds..."
-          sleep 5
-          attempt=$((attempt + 1))
-        done
+        # Start Tailscale with authentication key
+        & "C:\Program Files\Tailscale\tailscale.exe" up --auth-key $env:TAILSCALE_AUTHKEY --hostname $env:TAILSCALE_HOSTNAME
+        
+        # Give it a moment to initialize
+        Start-Sleep -Seconds 10
+        
+    - name: Wait for Tailscale to be Ready (PowerShell)
+      shell: powershell
+      id: wait-tailscale
+      run: |
+        $timeoutSeconds = ${{ github.event.inputs.timeout || 300 }}
+        $intervalSeconds = 5
+        $maxAttempts = [math]::Ceiling($timeoutSeconds / $intervalSeconds)
+        $attempt = 1
+        
+        Write-Host "Waiting for Tailscale to be ready (timeout: $timeoutSeconds seconds)..."
+        
+        while ($attempt -le $maxAttempts) {
+            Write-Host "Attempt $attempt of $maxAttempts..."
+            
+            # Check if Tailscale is running
+            $status = & "C:\Program Files\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+            
+            if ($status.BackendState -eq "Running") {
+                Write-Host "✓ Tailscale is running!"
+                
+                # Get Tailscale IP
+                $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip --4
+                Write-Host "Tailscale IP: $tsIP"
+                
+                # Set outputs for next steps
+                echo "ts_ip=$tsIP" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                echo "status=ready" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                
+                exit 0
+            }
+            
+            if ($attempt -eq $maxAttempts) {
+                Write-Host "❌ Tailscale failed to start within timeout"
+                & "C:\Program Files\Tailscale\tailscale.exe" status
+                echo "status=timeout" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                exit 1
+            }
+            
+            Write-Host "Waiting $intervalSeconds seconds..."
+            Start-Sleep -Seconds $intervalSeconds
+            $attempt++
+        }
+        
+    - name: Verify Tailscale Connectivity
+      if: steps.wait-tailscale.outputs.status == 'ready'
+      shell: powershell
+      run: |
+        Write-Host "Verifying Tailscale connectivity..."
+        
+        # Show Tailscale status
+        & "C:\Program Files\Tailscale\tailscale.exe" status
+        
+        # Get network info
+        $tsIP = "${{ steps.wait-tailscale.outputs.ts_ip }}"
+        Write-Host "Assigned Tailscale IP: $tsIP"
+        
+        # Test basic connectivity (ping localhost via Tailscale)
+        Write-Host "Testing network connectivity..."
+        Test-NetConnection -ComputerName $tsIP -InformationLevel Quiet
+        
+        # List Tailscale peers
+        Write-Host "Tailscale peers:"
+        & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty Peer
+        
+    - name: Use Tailscale Network for Tasks
+      if: steps.wait-tailscale.outputs.status == 'ready'
+      shell: powershell
+      run: |
+        Write-Host "Running tasks over Tailscale network..."
+        
+        # Example: Access internal resources
+        # $internalService = "your-internal-service.tailscale"
+        # Invoke-WebRequest -Uri "http://$internalService" -UseBasicParsing
+        
+        # Example: Copy files over Tailscale
+        # Copy-Item -Path "C:\local\file.txt" -Destination "\\$tsIP\share\file.txt"
+        
+        # Your Windows-specific tasks here
+        Write-Host "Current directory: $(Get-Location)"
+        Get-NetAdapter | Where-Object {$_.InterfaceDescription -like "*Tailscale*"}
+        
+    - name: Cleanup Tailscale (Optional)
+      if: always()
+      shell: powershell
+      run: |
+        Write-Host "Cleaning up Tailscale..."
+        try {
+            & "C:\Program Files\Tailscale\tailscale.exe" down
+            Write-Host "Tailscale disconnected"
+        } catch {
+            Write-Host "Cleanup failed: $_"
+        }
