@@ -1,268 +1,54 @@
-name: Windows Tailscale Setup with Debug
+name: Tailscale Windows Simple
 
-on:
-  workflow_dispatch:  # Manual trigger for debugging
-
-env:
-  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
+on: workflow_dispatch
 
 jobs:
-  setup-tailscale:
+  tailscale-windows:
     runs-on: windows-latest
     
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      
-    - name: Debug Environment
+    - uses: actions/checkout@v4
+    
+    - name: Setup Tailscale
+      uses: tailscale/github-action@v3
+      with:
+        version: latest
+        authkey: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
+        hostname: windows-gh-${{ github.run_id }}
+        # Windows-specific options
+        args: |
+          --accept-dns=true
+          --accept-routes=false
+          --shields-up=false
+          
+    - name: Wait for connection
       shell: powershell
       run: |
-        Write-Host "GitHub Workspace: $env:GITHUB_WORKSPACE"
-        Write-Host "Runner Temp: $env:RUNNER_TEMP"
-        Write-Host "Current user: $env:USERNAME"
+        # Wait for Tailscale
+        $maxWait = 60
+        $waitCount = 0
         
-    - name: Download Tailscale Installer
-      shell: powershell
-      run: |
-        # Download to temp directory
-        $installerPath = "$env:RUNNER_TEMP\TailscaleSetup.exe"
-        Write-Host "Downloading Tailscale to: $installerPath"
-        
-        # Download with retry
-        $retryCount = 0
-        $maxRetries = 3
-        
-        while ($retryCount -lt $maxRetries) {
+        while ($waitCount -lt $maxWait) {
             try {
-                Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/TailscaleSetup.exe" `
-                                 -OutFile $installerPath `
-                                 -UserAgent "GitHubActions"
-                Write-Host "Download successful"
-                break
-            } catch {
-                $retryCount++
-                Write-Host "Download attempt $retryCount failed: $_"
-                if ($retryCount -eq $maxRetries) {
-                    throw "Failed to download Tailscale after $maxRetries attempts"
-                }
-                Start-Sleep -Seconds 5
-            }
-        }
-        
-        # Verify file exists
-        if (Test-Path $installerPath) {
-            Write-Host "File size: $((Get-Item $installerPath).Length) bytes"
-        } else {
-            throw "Installer not found after download"
-        }
-        
-    - name: Install Tailscale Silently
-      shell: powershell
-      run: |
-        $installerPath = "$env:RUNNER_TEMP\TailscaleSetup.exe"
-        
-        Write-Host "Installing Tailscale..."
-        
-        # Try different installation methods
-        try {
-            # Method 1: Standard silent install
-            $process = Start-Process -FilePath $installerPath `
-                                     -ArgumentList "/S" `
-                                     -Wait `
-                                     -PassThru `
-                                     -NoNewWindow
-            
-            Write-Host "Exit code: $($process.ExitCode)"
-            
-            if ($process.ExitCode -ne 0) {
-                Write-Host "Trying alternative installation method..."
-                
-                # Method 2: Use msiexec if it's an MSI inside
-                Start-Process -FilePath "msiexec.exe" `
-                             -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
-                             -Wait `
-                             -NoNewWindow
-            }
-            
-        } catch {
-            Write-Host "Installation error: $_"
-            # Try one more method
-            Write-Host "Trying with cmd.exe..."
-            cmd.exe /c "`"$installerPath`" /S"
-        }
-        
-        # Wait for service to register
-        Start-Sleep -Seconds 10
-        
-    - name: Verify Tailscale Installation
-      shell: powershell
-      run: |
-        Write-Host "Checking Tailscale installation..."
-        
-        # Check if Tailscale executable exists
-        $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
-        if (Test-Path $tailscaleExe) {
-            Write-Host "✓ Tailscale found at: $tailscaleExe"
-            # Get version
-            & $tailscaleExe version
-        } else {
-            # Check alternative locations
-            Write-Host "Checking alternative locations..."
-            $possiblePaths = @(
-                "C:\Program Files\Tailscale\tailscale.exe",
-                "C:\Program Files (x86)\Tailscale\tailscale.exe",
-                "$env:LOCALAPPDATA\Tailscale\tailscale.exe"
-            )
-            
-            $found = $false
-            foreach ($path in $possiblePaths) {
-                if (Test-Path $path) {
-                    $tailscaleExe = $path
-                    Write-Host "✓ Found at: $path"
-                    $found = $true
+                $status = tailscale.exe status --json 2>$null | ConvertFrom-Json
+                if ($status.BackendState -eq "Running") {
+                    Write-Host "✅ Tailscale connected!"
+                    tailscale.exe status
                     break
                 }
-            }
-            
-            if (-not $found) {
-                throw "Tailscale not found in any expected location"
-            }
-        }
-        
-        # Add to PATH for current session
-        $env:Path = "$(Split-Path $tailscaleExe);$env:Path"
-        
-    - name: Start Tailscale (Simplified)
-      shell: powershell
-      run: |
-        $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
-        if (-not (Test-Path $tailscaleExe)) {
-            $tailscaleExe = "tailscale.exe"
-        }
-        
-        Write-Host "Starting Tailscale with authkey..."
-        
-        # First, make sure Tailscale service is running
-        try {
-            Get-Service -Name Tailscale -ErrorAction Stop | Start-Service
-            Write-Host "Tailscale service started"
-        } catch {
-            Write-Host "Service may not exist yet, continuing..."
-        }
-        
-        # Start Tailscale with authkey
-        & $tailscaleExe up --auth-key $env:TAILSCALE_AUTHKEY --hostname "github-win-$env:GITHUB_RUN_ID"
-        
-        # Wait a bit
-        Start-Sleep -Seconds 15
-        
-    - name: Check Tailscale Status (Simple)
-      shell: powershell
-      id: check-status
-      run: |
-        $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
-        if (-not (Test-Path $tailscaleExe)) {
-            $tailscaleExe = "tailscale.exe"
-        }
-        
-        # Simple check - just run status
-        Write-Host "Checking Tailscale status..."
-        
-        # Try multiple times
-        $maxAttempts = 10
-        $attempt = 1
-        
-        while ($attempt -le $maxAttempts) {
-            Write-Host "Attempt $attempt of $maxAttempts"
-            
-            try {
-                $status = & $tailscaleExe status 2>&1
-                Write-Host "Status output:"
-                Write-Host $status
-                
-                # Check for success indicators
-                if ($status -match "Active" -or $status -match "logged in") {
-                    Write-Host "✓ Tailscale appears to be active"
-                    
-                    # Get IP
-                    $ip = & $tailscaleExe ip --4 2>&1
-                    Write-Host "Tailscale IP: $ip"
-                    
-                    # Set output
-                    echo "ts_ip=$ip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-                    echo "status=success" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-                    
-                    exit 0
-                }
-                
-                # Check for error
-                if ($status -match "Failed" -or $status -match "Error") {
-                    Write-Host "Tailscale reported error"
-                    break
-                }
-                
             } catch {
-                Write-Host "Error checking status: $_"
+                Write-Host "Waiting... ($waitCount/$maxWait)"
             }
-            
-            if ($attempt -eq $maxAttempts) {
-                Write-Host "Max attempts reached"
-                echo "status=failed" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-                exit 0  # Don't fail the step, just report status
-            }
-            
-            Write-Host "Waiting 10 seconds..."
-            Start-Sleep -Seconds 10
-            $attempt++
+            $waitCount++
+            Start-Sleep -Seconds 2
         }
         
-        echo "status=timeout" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        
-    - name: Debug Info on Failure
-      if: steps.check-status.outputs.status != 'success'
-      shell: powershell
-      run: |
-        Write-Host "=== DEBUG INFORMATION ==="
-        
-        # Check services
-        Write-Host "Services related to Tailscale:"
-        Get-Service | Where-Object {$_.Name -like "*tail*" -or $_.DisplayName -like "*tail*"} | Format-Table -AutoSize
-        
-        # Check processes
-        Write-Host "Processes:"
-        Get-Process | Where-Object {$_.ProcessName -like "*tail*"} | Format-Table -AutoSize
-        
-        # Check if executable exists
-        Write-Host "Looking for tailscale.exe:"
-        Get-ChildItem -Path "C:\" -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object FullName
-        
-        # Network adapters
-        Write-Host "Network adapters:"
-        Get-NetAdapter | Format-Table -AutoSize
-        
-        # Try to run tailscale with debug
-        Write-Host "Trying to run tailscale:"
-        try {
-            & "tailscale.exe" version
-        } catch {
-            Write-Host "tailscale.exe not in PATH"
+        if ($waitCount -ge $maxWait) {
+            Write-Host "⚠️ Tailscale may still be connecting"
         }
         
-    - name: Continue Even If Failed
+    - name: Run your tasks
       shell: powershell
       run: |
-        Write-Host "Tailscale status: ${{ steps.check-status.outputs.status }}"
-        Write-Host "This step runs regardless of Tailscale status"
-        Write-Host "You can add your main workflow tasks here"
-        
-    - name: Cleanup
-      if: always()
-      shell: powershell
-      run: |
-        Write-Host "Cleaning up..."
-        try {
-            # Try to disconnect
-            & "tailscale.exe" down 2>$null
-        } catch {
-            Write-Host "Cleanup skipped - tailscale not available"
-        }
+        Write-Host "Your Windows tasks here"
+        # Now you can use Tailscale network
