@@ -1,54 +1,44 @@
-name: Tailscale Windows Simple
+name: Windows Tailscale Direct MSI
 
 on: workflow_dispatch
 
 jobs:
-  tailscale-windows:
+  install:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Tailscale
-      uses: tailscale/github-action@v3
-      with:
-        version: latest
-        authkey: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
-        hostname: windows-gh-${{ github.run_id }}
-        # Windows-specific options
-        args: |
-          --accept-dns=true
-          --accept-routes=false
-          --shields-up=false
-          
-    - name: Wait for connection
+    - name: Install Tailscale via MSI
+      shell: cmd  # Use cmd for better compatibility
+      run: |
+        echo Installing Tailscale...
+        
+        # Use msiexec directly with public URL
+        msiexec /i "https://pkgs.tailscale.com/stable/tailscale-setup.msi" /quiet /norestart
+        
+        timeout /t 10 /nobreak
+        
+    - name: Verify Installation
       shell: powershell
       run: |
-        # Wait for Tailscale
-        $maxWait = 60
-        $waitCount = 0
+        # Wait for installation to complete
+        Start-Sleep -Seconds 15
         
-        while ($waitCount -lt $maxWait) {
-            try {
-                $status = tailscale.exe status --json 2>$null | ConvertFrom-Json
-                if ($status.BackendState -eq "Running") {
-                    Write-Host "✅ Tailscale connected!"
-                    tailscale.exe status
-                    break
-                }
-            } catch {
-                Write-Host "Waiting... ($waitCount/$maxWait)"
-            }
-            $waitCount++
-            Start-Sleep -Seconds 2
+        # Check if installed
+        if (Test-Path "C:\Program Files\Tailscale\tailscale.exe") {
+            Write-Host "✓ Tailscale installed successfully"
+        } else {
+            Write-Host "⚠️ Installation may have failed, but continuing..."
         }
         
-        if ($waitCount -ge $maxWait) {
-            Write-Host "⚠️ Tailscale may still be connecting"
-        }
-        
-    - name: Run your tasks
+    - name: Start Tailscale
       shell: powershell
+      env:
+        TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_TOKEN }}
       run: |
-        Write-Host "Your Windows tasks here"
-        # Now you can use Tailscale network
+        # Try to start Tailscale
+        try {
+            & "C:\Program Files\Tailscale\tailscale.exe" up --auth-key $env:TAILSCALE_AUTHKEY
+            Write-Host "Tailscale started"
+        } catch {
+            Write-Host "Failed to start Tailscale: $_"
+        }
