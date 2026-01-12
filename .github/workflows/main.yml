@@ -1,319 +1,44 @@
-name: RDP Auto Connect
+name: Setup Tailscale and Wait
 
 on:
+  push:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  auto-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
-
+  setup-tailscale:
+    runs-on: ubuntu-latest
+    
     steps:
-      - name: Configure RDP Settings
-        run: |
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --auth-key=${{ secrets.TAILSCALE_AUTH_TOKEN }}
+        
+    - name: Wait for Tailscale to be ready
+      run: |
+        max_attempts=30
+        attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Checking Tailscale status (attempt $attempt/$max_attempts)..."
           
-          # Configure firewall
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service TermService -Force
-
-      - name: Create Auto-Login User
-        run: |
-          $password = "AutoRDP@$(Get-Date -Format 'MMdd')!"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "AutoRDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "AutoRDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AutoRDP"
+          if tailscale status --json | grep -q '"BackendState":"Running"'; then
+            echo "✓ Tailscale is running!"
+            echo "IP address: $(tailscale ip --4)"
+            break
+          fi
           
-          # Enable auto-logon
-          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-          Set-ItemProperty -Path $regPath -Name "AutoAdminLogon" -Value "1"
-          Set-ItemProperty -Path $regPath -Name "DefaultUserName" -Value "AutoRDP"
-          Set-ItemProperty -Path $regPath -Name "DefaultPassword" -Value $password
+          if [ $attempt -eq $max_attempts ]; then
+            echo "✗ Tailscale failed to start within timeout"
+            tailscale status
+            exit 1
+          fi
           
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "User created: AutoRDP / $password"
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -Wait -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart"
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed successfully"
-
-      - name: Connect Tailscale and Get IP
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-auto-rdp-$env:GITHUB_RUN_ID
-          
-          $tsIP = $null
-          $attempts = 0
-          while (-not $tsIP -and $attempts -lt 20) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 3
-                  $attempts++
-              }
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Failed to get Tailscale IP after 20 attempts"
-              exit 1
-          }
-          
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP obtained: $tsIP"
-
-      - name: Create Auto-Connect Files
-        run: |
-          $tsIP = $env:TAILSCALE_IP
-          $password = $env:RDP_PASSWORD
-          
-          # Create RDP connection file
-          $rdpContent = @"
-screen mode id:i:2
-use multimon:i:0
-desktopwidth:i:1920
-desktopheight:i:1080
-session bpp:i:32
-winposstr:s:0,1,0,0,800,600
-compression:i:1
-keyboardhook:i:2
-audiocapturemode:i:0
-videoplaybackmode:i:1
-connection type:i:7
-networkautodetect:i:1
-bandwidthautodetect:i:1
-displayconnectionbar:i:1
-enableworkspacereconnect:i:0
-disable wallpaper:i:0
-allow font smoothing:i:0
-allow desktop composition:i:0
-disable full window drag:i:1
-disable menu anims:i:1
-disable themes:i:0
-disable cursor setting:i:0
-bitmapcachepersistenable:i:1
-full address:s:$tsIP
-audiomode:i:0
-redirectprinters:i:1
-redirectcomports:i:0
-redirectsmartcards:i:1
-redirectclipboard:i:1
-redirectposdevices:i:0
-autoreconnection enabled:i:1
-authentication level:i:0
-prompt for credentials:i:0
-negotiate security layer:i:0
-remoteapplicationmode:i:0
-alternate shell:s:
-shell working directory:s:
-gatewayhostname:s:
-gatewayusagemethod:i:4
-gatewaycredentialssource:i:4
-gatewayprofileusagemethod:i:0
-promptcredentialonce:i:0
-use redirection server name:i:0
-"@
-          
-          $rdpPath = "$env:TEMP\auto_connect.rdp"
-          $rdpContent | Out-File -FilePath $rdpPath -Encoding ASCII
-          Write-Host "RDP file created: $rdpPath"
-          
-          # Create batch file for auto-connection
-          $batchContent = @"
-@echo off
-echo ========================================
-echo RDP AUTO-CONNECT SCRIPT
-echo ========================================
-echo.
-echo Step 1: Saving credentials to Windows...
-cmdkey /generic:$tsIP /user:AutoRDP /pass:$password
-echo.
-echo Step 2: Connecting to RDP...
-echo Connection details:
-echo IP Address: $tsIP
-echo Username: AutoRDP
-echo Password: $password
-echo.
-echo If connection doesn't start automatically, run:
-echo mstsc /v:$tsIP
-echo.
-timeout /t 3
-mstsc /v:$tsIP
-"@
-          
-          $batchPath = "$env:TEMP\connect_rdp.bat"
-          $batchContent | Out-File -FilePath $batchPath -Encoding ASCII
-          Write-Host "Batch file created: $batchPath"
-          
-          # Create PowerShell script with all options
-          $psScript = @"
-# ========================================
-# RDP AUTO-CONNECT POWERSHELL SCRIPT
-# ========================================
-
-`$tsIP = "$tsIP"
-`$username = "AutoRDP"
-`$password = "$password"
-
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "🎯 RDP AUTO-CONNECTION READY!" -ForegroundColor Yellow
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "IP Address: `$tsIP" -ForegroundColor Cyan
-Write-Host "Username: `$username" -ForegroundColor Cyan
-Write-Host "Password: `$password" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "AUTO-CONNECT OPTIONS:" -ForegroundColor Yellow
-Write-Host "1. Save credentials and connect:" -ForegroundColor White
-Write-Host "   cmdkey /generic:`$tsIP /user:`$username /pass:`$password"
-Write-Host "   mstsc /v:`$tsIP"
-Write-Host ""
-Write-Host "2. Connect directly:" -ForegroundColor White
-Write-Host "   mstsc /v:`$tsIP"
-Write-Host ""
-Write-Host "3. Use RDP file:" -ForegroundColor White
-Write-Host "   mstsc `"$rdpPath`""
-Write-Host ""
-Write-Host "4. One-click connection:" -ForegroundColor White
-Write-Host "   & `"$batchPath`""
-Write-Host ""
-Write-Host "NOTE: This session will end when workflow is cancelled!" -ForegroundColor Red
-Write-Host "========================================" -ForegroundColor Green
-
-# Optional: Auto-save credentials
-`$choice = Read-Host "Auto-save credentials and connect? (Y/N)"
-if (`$choice -eq 'Y' -or `$choice -eq 'y') {
-    cmdkey /generic:`$tsIP /user:`$username /pass:`$password
-    mstsc /v:`$tsIP
-}
-"@
-          
-          $psPath = "$env:TEMP\rdp_auto.ps1"
-          $psScript | Out-File -FilePath $psPath -Encoding UTF8
-          Write-Host "PowerShell script created: $psPath"
-          
-          # Save connection info to file
-          $infoContent = @"
-========================================
-AUTO RDP CONNECTION - COPY THIS INFO
-========================================
-IP ADDRESS: $tsIP
-USERNAME: AutoRDP
-PASSWORD: $password
-DATE: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-========================================
-
-QUICK CONNECT COMMANDS:
-1. Windows CMD/PowerShell:
-   mstsc /v:$tsIP
-   (Use credentials: AutoRDP / $password)
-
-2. With saved credentials:
-   cmdkey /generic:$tsIP /user:AutoRDP /pass:$password
-   mstsc /v:$tsIP
-
-3. Using RDP file:
-   File saved at: $rdpPath
-   Double-click to connect
-
-AUTOMATIC CONNECTION FILES:
-- Batch file: $batchPath
-- PowerShell: $psPath
-- RDP file: $rdpPath
-
-IMPORTANT:
-- Cancel GitHub workflow when done
-- Session auto-expires when cancelled
-- Password changes daily: AutoRDP@MMdd!
-========================================
-"@
-          
-          $infoPath = "$env:TEMP\connection_info.txt"
-          $infoContent | Out-File -FilePath $infoPath -Encoding UTF8
-          echo "CONNECTION_INFO=$infoPath" >> $env:GITHUB_ENV
-
-      - name: Display Connection Information
-        run: |
-          $tsIP = $env:TAILSCALE_IP
-          $password = $env:RDP_PASSWORD
-          
-          Write-Host ""
-          Write-Host "██████╗ ██████╗ ██████╗ " -ForegroundColor Cyan
-          Write-Host "██╔══██╗██╔══██╗██╔══██╗" -ForegroundColor Cyan
-          Write-Host "██████╔╝██████╔╝██████╔╝" -ForegroundColor Cyan
-          Write-Host "██╔═══╝ ██╔═══╝ ██╔═══╝ " -ForegroundColor Cyan
-          Write-Host "██║     ██║     ██║     " -ForegroundColor Cyan
-          Write-Host "╚═╝     ╚═╝     ╚═╝     " -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "═══════════════════════════════════════════" -ForegroundColor Green
-          Write-Host "🚀  RDP AUTO-CONNECT READY!" -ForegroundColor Yellow
-          Write-Host "═══════════════════════════════════════════" -ForegroundColor Green
-          Write-Host ""
-          Write-Host "🔗 DIRECT CONNECTION:" -ForegroundColor White
-          Write-Host "   mstsc /v:$tsIP" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "👤 CREDENTIALS:" -ForegroundColor White
-          Write-Host "   Username: AutoRDP" -ForegroundColor Cyan
-          Write-Host "   Password: $password" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "⚡ ONE-COMMAND CONNECT:" -ForegroundColor White
-          Write-Host "   cmdkey /generic:$tsIP /user:AutoRDP /pass:$password && mstsc /v:$tsIP" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "📁 AUTO-CONNECT FILES CREATED:" -ForegroundColor White
-          Write-Host "   • connect_rdp.bat - Double-click to connect" -ForegroundColor Cyan
-          Write-Host "   • auto_connect.rdp - RDP connection file" -ForegroundColor Cyan
-          Write-Host "   • rdp_auto.ps1 - PowerShell auto-connect" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "⚠️  IMPORTANT NOTES:" -ForegroundColor Red
-          Write-Host "   • Cancel this workflow when done!" -ForegroundColor Yellow
-          Write-Host "   • Password changes daily" -ForegroundColor Yellow
-          Write-Host "   • Only accessible via Tailscale" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "⏰ SESSION ACTIVE UNTIL: $((Get-Date).AddMinutes(3600).ToString('HH:mm:ss'))" -ForegroundColor Magenta
-          Write-Host "═══════════════════════════════════════════" -ForegroundColor Green
-
-      - name: Keep Session Alive
-        run: |
-          $tsIP = $env:TAILSCALE_IP
-          $password = $env:RDP_PASSWORD
-          $startTime = Get-Date
-          
-          while ($true) {
-              $currentTime = Get-Date
-              $elapsed = $currentTime - $startTime
-              $hours = [math]::Floor($elapsed.TotalHours)
-              $minutes = $elapsed.Minutes
-              
-              Clear-Host
-              Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-              Write-Host "🖥️  RDP SESSION ACTIVE" -ForegroundColor Green
-              Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-              Write-Host ""
-              Write-Host "⏰ Uptime: $hours hours, $minutes minutes" -ForegroundColor White
-              Write-Host "🕐 Current: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
-              Write-Host ""
-              Write-Host "🔗 CONNECT NOW:" -ForegroundColor Yellow
-              Write-Host "IP: $tsIP" -ForegroundColor Cyan
-              Write-Host "User: AutoRDP" -ForegroundColor Cyan
-              Write-Host "Pass: $password" -ForegroundColor Cyan
-              Write-Host ""
-              Write-Host "⚡ Quick command:" -ForegroundColor Yellow
-              Write-Host "mstsc /v:$tsIP" -ForegroundColor Green
-              Write-Host ""
-              Write-Host "📞 To stop: Cancel this workflow in GitHub" -ForegroundColor Red
-              Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-              
-              # Test RDP port is still open
-              $test = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-              if (-not $test.TcpTestSucceeded) {
-                  Write-Host "⚠️  RDP port check failed!" -ForegroundColor Red
-              } else {
-                  Write-Host "✅ RDP port is accessible" -ForegroundColor Green
-              }
-              
-              Start-Sleep -Seconds 30
-          }
+          echo "Waiting 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
