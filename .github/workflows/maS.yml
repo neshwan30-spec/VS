@@ -32,25 +32,25 @@ jobs:
       - name: Create RDP User
         run: |
           # Create password that meets Windows requirements
-          $password = "D12345678Da!"
+          $password = "D12345678@"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          # Create the user
-          New-LocalUser -Name "TK***" -Password $securePass -AccountNeverExpires
+          # Create the user with valid username (no special characters)
+          New-LocalUser -Name "TKUser" -Password $securePass -AccountNeverExpires
           
           # Add to required groups
-          Add-LocalGroupMember -Group "Administrators" -Member "TK***"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TK***"
+          Add-LocalGroupMember -Group "Administrators" -Member "TKUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TKUser"
           
           # Verify user was created
-          if (-not (Get-LocalUser -Name "TK***" -ErrorAction SilentlyContinue)) {
+          if (-not (Get-LocalUser -Name "TKUser" -ErrorAction SilentlyContinue)) {
               Write-Error "User creation failed"
               exit 1
           }
           
           # Store credentials in environment variable
-          echo "RDP_CREDS=User: TK*** | Password: $password" >> $env:GITHUB_ENV
-          Write-Host "User TK*** created successfully"
+          echo "RDP_CREDS=User: TKUser | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "User TKUser created successfully"
 
       - name: Install Tailscale
         run: |
@@ -97,8 +97,8 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: TK***"
-          Write-Host "Password: D12345678Da!"
+          Write-Host "Username: TKUser"
+          Write-Host "Password: D12345678@"
           Write-Host "==================`n"
           
           # Keep runner active indefinitely (or until manually cancelled)
