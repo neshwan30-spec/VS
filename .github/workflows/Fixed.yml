@@ -1,0 +1,139 @@
+name: R Fixed
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 36000
+
+    steps:
+      # 1. Enable RDP and Configure Firewall
+      - name: Configure RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable Network Level Authentication (Allows connection without initial auth screen)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          
+          # Remove old firewall rules to avoid duplicates
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          
+          # Allow port 3389 through firewall
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          # Restart RDP Service to apply changes
+          Restart-Service -Name TermService -Force
+
+      # 2. Manage Users and Passwords
+      - name: Reset Admin Passwords
+        run: |
+          $password = "D12345678@"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # FIX: Explicitly reset runneradmin password to a known value
+          Write-Host "Resetting runneradmin password..."
+          Set-LocalUser -Name "runneradmin" -Password $securePass
+          
+          # Also ensure the 'RDP' user exists and has the same password
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          # NOTE: AutoAdminLogon is disabled here because it requires a reboot 
+          # which will terminate this temporary GitHub runner.
+
+      # 3. Install Tailscale
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      # 4. Connect Tailscale
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with auth key. --reset ensures clean state.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --reset
+          
+          # Wait for IP assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Check Auth Key."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      # 5. Install Additional Tools (XAMPP & ProxyScrape)
+      - name: Install Additional Tools (XAMPP & ProxyScrape)
+        run: |
+          Write-Host "Downloading ProxyScrape Proxy Checker..."
+          $psUrl = "https://downloads.cdn.proxyscrape.com/proxy-checker/proxyscrape-proxy-checker-v1.1.0-x64-win-installer.exe"
+          $psPath = "$env:TEMP\proxyscrape-installer.exe"
+          # Using curl.exe for better reliability with binary downloads
+          curl.exe -L $psUrl -o $psPath
+          
+          Write-Host "Installing ProxyScrape..."
+          Start-Process $psPath -ArgumentList "/S" -Wait
+          Remove-Item $psPath -Force
+
+          Write-Host "Downloading XAMPP..."
+          $xamppUrl = "https://sourceforge.net/projects/xampp/files/XAMPP%20Windows/8.2.12/xampp-windows-x64-8.2.12-0-VS16-installer.exe/download"
+          $xamppPath = "$env:TEMP\xampp-installer.exe"
+          # Using curl.exe -L to follow SourceForge redirects correctly
+          curl.exe -L $xamppUrl -o $xamppPath
+          
+          Write-Host "Installing XAMPP (This may take a few minutes)..."
+          # --mode unattended installs XAMPP silently without GUI prompts
+          Start-Process $xamppPath -ArgumentList "--mode unattended --unattendedmodeui minimal" -Wait
+          Remove-Item $xamppPath -Force
+          
+          Write-Host "Installation of ProxyScrape and XAMPP completed."
+
+      # 6. Verify Connectivity
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP Port 3389 is not reachable."
+              exit 1
+          }
+          Write-Host "RDP Port 3389 is Open and Reachable."
+
+      # 7. Display Credentials and Maintain Connection
+      - name: Display Connection Info
+        run: |
+          Write-Host "`n============================================"
+          Write-Host "   RDP CONNECTION ESTABLISHED"
+          Write-Host "============================================"
+          Write-Host "IP Address : $env:TAILSCALE_IP"
+          Write-Host "Username   : runneradmin"
+          Write-Host "Password   : D12345678@"
+          Write-Host "--------------------------------------------"
+          Write-Host "Backup User: RDP"
+          Write-Host "Backup Pass: D12345678@"
+          Write-Host "============================================"
+          Write-Host "TIP: Click 'Show Options' in RDP client, save"
+          Write-Host "     these credentials to auto-fill next time."
+          Write-Host "============================================`n"
+          
+          # Keep runner active
+          while ($true) {
+              Write-Host "[$(Get-Date)] Session Active... (Press 'Cancel Workflow' to stop)"
+              Start-Sleep -Seconds 300
+          }
