@@ -1,4 +1,4 @@
-name: Temporary Tailscale RDP
+name: TK
 
 on:
   workflow_dispatch: # Allows you to trigger this manually from the Actions tab
