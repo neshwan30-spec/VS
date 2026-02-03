@@ -1,23 +1,31 @@
-name: TK
+name: Windows Server 2022 RDP
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-latest  # This IS the best Windows version GitHub has (Server 2022)
     timeout-minutes: 360
+
     steps:
       - name: Enable RDP
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd!" -Force)
-      - name: Install Tailscale
+          Write-Host "RDP Enabled on Windows Server 2022"
+
+      - name: Download & Install Tailscale
         run: |
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "t.msi"
           Start-Process msiexec.exe -Wait -ArgumentList '/I t.msi /quiet'
-      - name: Connect
+
+      - name: Connect Tailscale
         run: & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --ssh
-      - name: Sleep
+
+      - name: Get IP
+        run: & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+
+      - name: Keep Alive
         run: Start-Sleep -Seconds 21600
