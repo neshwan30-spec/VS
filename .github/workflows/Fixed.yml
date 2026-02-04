@@ -3,10 +3,6 @@ name: RDP (Windows Latest)
 on:
   workflow_dispatch:
     inputs:
-      tailscale_auth_key:
-        description: 'Tailscale Auth Key (reusable)'
-        required: true
-        type: string
       rdp_username:
         description: 'RDP Username'
         required: false
@@ -89,9 +85,12 @@ jobs:
         run: |
           $env:PATH += ";$env:ProgramFiles\Tailscale"
           
-          # Login using the provided Auth Key
+          # AUTH KEY IS HARDCODED HERE
+          $authKey = "tskey-auth-kJwFL9VMaT11CNTRL-z1UFbVp1oPNEkjcsEu7ZQNWVDzKsjcYZ"
+          
+          # Login using the Auth Key
           # Use a unique hostname based on Run ID and Job ID to avoid conflicts
-          & "tailscale.exe" up --authkey=${{ inputs.tailscale_auth_key }} --hostname=gh-runner-${{ github.run_id }}
+          & "tailscale.exe" up --authkey=$authKey --hostname=gh-runner-${{ github.run_id }}
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
@@ -112,6 +111,7 @@ jobs:
               exit 1
           }
           
+          # Save IP to Environment Variable so it shows up in Summary
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP acquired: $tsIP"
 
