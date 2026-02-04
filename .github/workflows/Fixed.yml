@@ -85,12 +85,25 @@ jobs:
         run: |
           $env:PATH += ";$env:ProgramFiles\Tailscale"
           
-          # AUTH KEY IS HARDCODED HERE
-          $authKey = "tskey-auth-kJwFL9VMaT11CNTRL-z1UFbVp1oPNEkjcsEu7ZQNWVDzKsjcYZ"
-          
+          # -------------------------------------------------------------
+          # PASTE YOUR NEW REUSABLE KEY HERE
+          # -------------------------------------------------------------
+          $authKey = "PUT_YOUR_NEW_REUSABLE_KEY_HERE"
+          # -------------------------------------------------------------
+
           # Login using the Auth Key
-          # Use a unique hostname based on Run ID and Job ID to avoid conflicts
-          & "tailscale.exe" up --authkey=$authKey --hostname=gh-runner-${{ github.run_id }}
+          # Using --reset to clear any stale state if this runner was reused (unlikely for windows-latest but safe to have)
+          Write-Host "Attempting to connect to Tailscale..."
+          
+          $upArgs = @("up", "--reset=always", "--authkey=$authKey", "--hostname=gh-runner-${{ github.run_id }}")
+          & "tailscale.exe" $upArgs
+          
+          # Check exit code
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale 'up' command failed. Please check logs above."
+              Write-Host "If the error is about the key, ensure you generated a NEW Reusable key."
+              exit 1
+          }
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
@@ -107,7 +120,8 @@ jobs:
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Check Auth Key or logs."
+              Write-Error "Tailscale IP not assigned after timeout."
+              & "tailscale.exe" status
               exit 1
           }
           
