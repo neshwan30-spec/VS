@@ -1,20 +1,316 @@
-name: Test RDP Workflow
+name: Secure RDP Setup with Tailscale
 
 on:
   workflow_dispatch:
     inputs:
-      duration:
-        description: 'Session duration'
+      session_hours:
+        description: 'Session duration in hours'
         required: true
         default: '6'
         type: choice
         options:
           - '1'
+          - '2'
+          - '4'
           - '6'
+          - '8'
           - '12'
+          - '24'
+
+env:
+  SESSION_TIMEOUT_MINUTES: ${{ fromJson('{"1": 60, "2": 120, "4": 240, "6": 360, "8": 480, "12": 720, "24": 1440}')[github.event.inputs.session_hours] }}
 
 jobs:
-  test:
+  secure-rdp:
     runs-on: windows-latest
+    timeout-minutes: ${{ env.SESSION_TIMEOUT_MINUTES }}
+
     steps:
-      - run: echo "Test workflow - Session duration: ${{ github.event.inputs.duration }} hours"
+      # 1. Generate Random Credentials
+      - name: Generate Secure Credentials
+        id: creds
+        run: |
+          # Generate random password (16 chars with letters, numbers, symbols)
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          
+          # Generate random username
+          $username = "gh-" + (-join ((65..90) + (97..122) | Get-Random -Count 6 | % {[char]$_}))
+          
+          # Store in GitHub environment
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          # Also create outputs for later steps
+          echo "username=$username" >> $env:GITHUB_OUTPUT
+          echo "password=$password" >> $env:GITHUB_OUTPUT
+
+      # 2. Enable RDP with Secure Configuration
+      - name: Configure RDP Settings
+        run: |
+          # Enable Remote Desktop with security
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # ENABLE Network Level Authentication for security
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          
+          # Set encryption level to High
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 3 -Force
+          
+          # Configure idle session timeout (15 minutes)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 900000
+          
+          # Clear old firewall rules
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          
+          # Add firewall rule (more restrictive)
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389 `
+            remoteip=100.64.0.0/10 `
+            description="RDP via Tailscale only"
+          
+          # Restart RDP service
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+      # 3. Create Secure User Account
+      - name: Create RDP User
+        run: |
+          # Create secure password
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          
+          # Create new user
+          New-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -Password $securePass `
+            -PasswordNeverExpires `
+            -AccountNeverExpires `
+            -Description "GitHub RDP Temporary User"
+          
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          
+          # Disable default administrator account for security
+          Disable-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+
+      # 4. Install Tailscale
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://dl.tailscale.com/stable/tailscale-setup-latest-amd64.exe"
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
+          
+          # Download with progress
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UserAgent "GitHubActions"
+          
+          # Install silently
+          Write-Host "Installing Tailscale..."
+          Start-Process $installerPath -ArgumentList "/S" -Wait
+          
+          # Wait for service to start
+          Start-Sleep -Seconds 10
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      # 5. Connect to Tailscale
+      - name: Establish Tailscale Connection
+        id: tailscale
+        run: |
+          # Wait for Tailscale to be ready
+          $maxRetries = 30
+          $retryCount = 0
+          $tsReady = $false
+          
+          while (-not $tsReady -and $retryCount -lt $maxRetries) {
+              try {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  if ($tsStatus.BackendState -eq "Running") {
+                      $tsReady = $true
+                      break
+                  }
+              } catch {}
+              
+              $retryCount++
+              Write-Host "Waiting for Tailscale... ($retryCount/$maxRetries)"
+              Start-Sleep -Seconds 2
+          }
+          
+          if (-not $tsReady) {
+              Write-Error "Tailscale failed to start"
+              exit 1
+          }
+          
+          # Connect to Tailscale
+          Write-Host "Connecting to Tailscale network..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-rdp-${{ github.run_id }} `
+            --accept-dns=false `
+            --accept-routes=false `
+            --shields-up=true `
+            --reset
+          
+          # Get Tailscale IP
+          $maxIpRetries = 10
+          $ipRetryCount = 0
+          $tsIP = $null
+          
+          while (-not $tsIP -and $ipRetryCount -lt $maxIpRetries) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) {
+                  break
+              }
+              $ipRetryCount++
+              Start-Sleep -Seconds 3
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "ip=$tsIP" >> $env:GITHUB_OUTPUT
+          
+          Write-Host "✓ Tailscale connected with IP: $tsIP"
+
+      # 6. Install Optional Tools
+      - name: Install Optional Tools
+        run: |
+          # Install Chocolatey if not present
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+          }
+          
+          # Refresh PATH
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          
+          # Install useful tools via Chocolatey
+          $tools = @(
+              "googlechrome",
+              "vscode",
+              "7zip",
+              "sysinternals",
+              "winscp",
+              "putty"
+          )
+          
+          foreach ($tool in $tools) {
+              try {
+                  choco install $tool -y --no-progress
+              } catch {
+                  Write-Warning "Failed to install $tool: $_"
+              }
+          }
+
+      # 7. Configure Security Settings
+      - name: Apply Security Hardening
+        run: |
+          # Enable Windows Defender real-time protection
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          
+          # Enable firewall
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+          
+          # Disable SMBv1 (security risk)
+          Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart
+          
+          # Disable Guest account
+          Disable-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+          
+          # Set screen timeout
+          powercfg /change monitor-timeout-ac 5
+          powercfg /change standby-timeout-ac 15
+
+      # 8. Verify Connectivity
+      - name: Verify RDP Accessibility
+        run: |
+          # Test local RDP port
+          $localTest = Test-NetConnection -ComputerName localhost -Port 3389 -WarningAction SilentlyContinue
+          if (-not $localTest.TcpTestSucceeded) {
+              Write-Error "RDP not listening locally"
+              exit 1
+          }
+          
+          # Test through Tailscale (optional)
+          try {
+              $remoteTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+              if ($remoteTest.TcpTestSucceeded) {
+                  Write-Host "✓ RDP accessible via Tailscale"
+              }
+          } catch {
+              Write-Warning "Could not verify remote connectivity (firewall may be blocking)"
+          }
+          
+          Write-Host "✓ RDP service is running and accessible"
+
+      # 9. Display Connection Information
+      - name: Display Connection Info
+        run: |
+          # Calculate expiration time
+          $expiryTime = (Get-Date).AddMinutes($env:SESSION_TIMEOUT_MINUTES)
+          
+          Write-Host "`n"
+          Write-Host "╔══════════════════════════════════════════════════════════════╗"
+          Write-Host "║                   SECURE RDP SESSION                        ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════╣"
+          Write-Host "║                                                              ║"
+          Write-Host "║  📍 Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "║  👤 Username:     $env:RDP_USERNAME"
+          Write-Host "║  🔑 Password:     $env:RDP_PASSWORD"
+          Write-Host "║  ⏰ Expires:      $($expiryTime.ToString('HH:mm:ss')) UTC"
+          Write-Host "║                                                              ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════╣"
+          Write-Host "║  🔒 SECURITY NOTES:                                         ║"
+          Write-Host "║  • Network Level Authentication (NLA) is ENABLED            ║"
+          Write-Host "║  • Session auto-terminates after ${{ github.event.inputs.session_hours }} hours      ║"
+          Write-Host "║  • All credentials are randomly generated                   ║"
+          Write-Host "║  • Connection restricted to Tailscale network               ║"
+          Write-Host "╚══════════════════════════════════════════════════════════════╝"
+          Write-Host "`n"
+          Write-Host "📋 RDP Connection String:"
+          Write-Host "mstsc /v:$env:TAILSCALE_IP /admin /f"
+          Write-Host "`n"
+          
+          # Save credentials to file (optional, for debugging)
+          $credFile = "$env:RUNNER_TEMP\rdp_credentials.txt"
+          @"
+RDP Connection Details:
+=======================
+IP Address: $env:TAILSCALE_IP
+Username:   $env:RDP_USERNAME
+Password:   $env:RDP_PASSWORD
+Expires:    $($expiryTime.ToString('yyyy-MM-dd HH:mm:ss')) UTC
+Generated:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC
+Session ID: ${{ github.run_id }}
+"@ | Out-File -FilePath $credFile
+          
+          Write-Host "Credentials saved to: $credFile"
+
+      # 10. Keep Session Alive with Countdown
+      - name: Maintain Session
+        run: |
+          $endTime = (Get-Date).AddMinutes($env:SESSION_TIMEOUT_MINUTES)
+          $refreshInterval = 60  # seconds
+          
+          while ((Get-Date) -lt $endTime) {
+              $remaining = $endTime - (Get-Date)
+              $hours = [math]::Floor($remaining.TotalHours)
+              $minutes = [math]::Floor($remaining.TotalMinutes % 60)
+              $seconds = [math]::Floor($remaining.TotalSeconds % 60)
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $($hours.ToString('00'))h $($minutes.ToString('00'))m $($seconds.ToString('00'))s remaining"
+              
+              # Update Tailscale status periodically
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status --active 2>$null
+              
+              # Sleep until next update
+              Start-Sleep -Seconds $refreshInterval
+          }
+          
+          Write-Host "Session time expired. Shutting down..."
