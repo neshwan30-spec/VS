@@ -3,6 +3,10 @@ name: RDP (Windows Latest)
 on:
   workflow_dispatch:
     inputs:
+      tailscale_auth_key:
+        description: 'Tailscale Auth Key (reusable)'
+        required: true
+        type: string
       rdp_username:
         description: 'RDP Username'
         required: false
@@ -85,25 +89,9 @@ jobs:
         run: |
           $env:PATH += ";$env:ProgramFiles\Tailscale"
           
-          # -------------------------------------------------------------
-          # PASTE YOUR NEW REUSABLE KEY HERE
-          # -------------------------------------------------------------
-          $authKey = "PUT_YOUR_NEW_REUSABLE_KEY_HERE"
-          # -------------------------------------------------------------
-
-          # Login using the Auth Key
-          # Using --reset to clear any stale state if this runner was reused (unlikely for windows-latest but safe to have)
-          Write-Host "Attempting to connect to Tailscale..."
-          
-          $upArgs = @("up", "--reset=always", "--authkey=$authKey", "--hostname=gh-runner-${{ github.run_id }}")
-          & "tailscale.exe" $upArgs
-          
-          # Check exit code
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale 'up' command failed. Please check logs above."
-              Write-Host "If the error is about the key, ensure you generated a NEW Reusable key."
-              exit 1
-          }
+          # Login using the provided Auth Key
+          # Use a unique hostname based on Run ID and Job ID to avoid conflicts
+          & "tailscale.exe" up --authkey=${{ inputs.tailscale_auth_key }} --hostname=gh-runner-${{ github.run_id }}
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
@@ -120,12 +108,10 @@ jobs:
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after timeout."
-              & "tailscale.exe" status
+              Write-Error "Tailscale IP not assigned. Check Auth Key or logs."
               exit 1
           }
           
-          # Save IP to Environment Variable so it shows up in Summary
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP acquired: $tsIP"
 
