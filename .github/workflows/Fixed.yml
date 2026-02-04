@@ -15,7 +15,7 @@ on:
       rdp_password:
         description: 'RDP Password (Min 8 chars)'
         required: false
-        default: 'D12345678@'
+        default: 'P@ssw0rd123!'
         type: string
 
 jobs:
@@ -152,4 +152,7 @@ jobs:
           while ($true) {
               Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Runner is active. Sleeping for 5 minutes..."
               Start-Sleep -Seconds 300
+              
+              # Optional: Simple heartbeat to ensure Tailscale doesn't die
+              # & "$env:ProgramFiles\Tailscale\tailscale.exe" ping 100.100.100.100 -c 1 | Out-Null
           }
